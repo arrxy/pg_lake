@@ -509,9 +509,9 @@ def test_vacuum_multiple_metadata_ops(s3, pg_conn, extension, with_default_locat
 
     assert any("merging 2 manifests into" in line for line in pg_conn.notices)
 
-    # triggers a single snapshot, we only have 2 snapshot expiring
-    # for INSERTs
-    assert sum("expiring" in line for line in pg_conn.notices) == 2
+    # the second INSERT auto-expired the first snapshot (max_snapshot_age=0),
+    # so VACUUM only expires the remaining INSERT snapshot after manifest merge
+    assert sum("expiring" in line for line in pg_conn.notices) == 1
 
     run_command(
         f"""
