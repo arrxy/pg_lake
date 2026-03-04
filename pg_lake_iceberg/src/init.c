@@ -33,6 +33,7 @@
 #include "pg_lake/iceberg/operations/manifest_merge.h"
 #include "pg_lake/iceberg/operations/vacuum.h"
 #include "pg_lake/object_store_catalog/object_store_catalog.h"
+#include "pg_lake/pgduck/write_data.h"
 #include "pg_lake/rest_catalog/rest_catalog.h"
 
 #define GUC_STANDARD 0
@@ -60,6 +61,13 @@ void		_PG_init(void);
 static const struct config_enum_entry RestCatalogAuthTypeOptions[] = {
 	{"default", REST_CATALOG_AUTH_TYPE_DEFAULT, false},
 	{"horizon", REST_CATALOG_AUTH_TYPE_HORIZON, false},
+	{NULL, 0, false},
+};
+
+/* pg_lake_iceberg.out_of_range_values */
+static const struct config_enum_entry IcebergOutOfRangeOptions[] = {
+	{"error", ICEBERG_OUT_OF_RANGE_ERROR, false},
+	{"clamp", ICEBERG_OUT_OF_RANGE_CLAMP, false},
 	{NULL, 0, false},
 };
 
@@ -314,6 +322,21 @@ _PG_init(void)
 							 true,
 							 PGC_SUSET,
 							 GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+							 "pg_lake_iceberg.out_of_range_values",
+							 gettext_noop("Determines behavior for out-of-range values "
+										  "during Iceberg writes. 'error' raises an error (default), "
+										  "'clamp' replaces out-of-range temporal values with the "
+										  "nearest valid boundary, and out-of-range numeric values "
+										  "(NaN, Inf, digit overflow) with NULL."),
+							 NULL,
+							 &IcebergOutOfRangeValues,
+							 ICEBERG_OUT_OF_RANGE_ERROR,
+							 IcebergOutOfRangeOptions,
+							 PGC_USERSET,
+							 0,
 							 NULL, NULL, NULL);
 
 	AvroInit();

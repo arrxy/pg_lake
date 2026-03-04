@@ -1047,6 +1047,20 @@ PrepareToAddQueryResultToTable(Oid relationId, char *readQuery, TupleDesc queryT
 int64
 AddQueryResultToTable(Oid relationId, char *readQuery, TupleDesc queryTupleDesc)
 {
+	/*
+	 * For INSERT..SELECT pushdown, the CustomScan's output slot has 0
+	 * attributes because the scan node doesn't return rows to PostgreSQL. We
+	 * need the target table's tuple descriptor so that
+	 * WrapQueryWithIcebergTemporalValidation can inspect column types.
+	 */
+	if (queryTupleDesc == NULL || queryTupleDesc->natts == 0)
+	{
+		Relation	rel = table_open(relationId, AccessShareLock);
+
+		queryTupleDesc = CreateTupleDescCopy(RelationGetDescr(rel));
+		table_close(rel, AccessShareLock);
+	}
+
 	int64		rowsProcessed = 0;
 	ForeignTable *foreignTable = GetForeignTable(relationId);
 	List	   *options = foreignTable->options;

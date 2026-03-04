@@ -88,6 +88,40 @@ pruning_data = [
     ),
     (
         True,
+        "date",
+        "prune_date_bc",
+        [
+            ("4712-01-01 BC", "4712-01-01 BC"),
+            ("4712-01-01 BC", "0001-01-01 BC"),
+            ("0001-01-01 BC", "4712-01-01 BC"),
+            ("0001-01-01 BC", "0001-01-01 BC"),
+        ],
+    ),
+    # Iceberg timestamps only support AD years 0001–9999; use early-AD values
+    (
+        True,
+        "timestamp",
+        "prune_timestamp_early_ad",
+        [
+            ("0001-01-01 00:00:00", "0001-01-01 00:00:00"),
+            ("0001-01-01 00:00:00", "0002-06-15 12:30:00"),
+            ("0002-06-15 12:30:00", "0001-01-01 00:00:00"),
+            ("0002-06-15 12:30:00", "0002-06-15 12:30:00"),
+        ],
+    ),
+    (
+        True,
+        "timestamptz",
+        "prune_timestamptz_early_ad",
+        [
+            ("0001-01-01 00:00:00+00", "0001-01-01 00:00:00+00"),
+            ("0001-01-01 00:00:00+00", "0002-06-15 12:30:00+00"),
+            ("0002-06-15 12:30:00+00", "0001-01-01 00:00:00+00"),
+            ("0002-06-15 12:30:00+00", "0002-06-15 12:30:00+00"),
+        ],
+    ),
+    (
+        True,
         "time",
         "prune_time",
         [
@@ -572,6 +606,88 @@ def test_datetime_partition_pruning_simple(
             pg_conn,
         )
         assert len(rows) == expected_rows, f"rows: {sql}"
+    run_command("RESET TIME ZONE;", pg_conn)
+    pg_conn.rollback()
+
+
+# Iceberg timestamps only support AD years (0001–9999), so only date
+# columns use BC values for partition pruning tests.
+bc_col_types = ["date"]
+bc_partition_types = ["year", "month", "day"]
+
+
+@pytest.mark.parametrize("partition_by", bc_partition_types)
+@pytest.mark.parametrize("col_type", bc_col_types)
+def test_bc_date_partition_pruning(
+    s3,
+    disable_data_file_pruning,
+    pg_conn,
+    extension,
+    with_default_location,
+    col_type,
+    partition_by,
+):
+    """Verify partition pruning works correctly with BC dates."""
+
+    explain_prefix = "EXPLAIN (analyze, verbose, format json) "
+
+    run_command(
+        f"""
+        CREATE SCHEMA test_bc_partition;
+        CREATE TABLE  test_bc_partition.tbl (
+            col_date {col_type}
+        ) USING iceberg
+        WITH (
+            autovacuum_enabled = 'False',
+            partition_by       = '{partition_by}(col_date)'
+        );
+        SET TIME ZONE 'UTC';
+    """,
+        pg_conn,
+    )
+
+    # insert BC and AD dates into separate data files via separate inserts
+    dates = [
+        "4712-01-01 BC",
+        "1000-01-01 BC",
+        "0001-01-01 BC",
+        "0001-01-01",
+        "1970-01-01",
+        "2021-01-01",
+    ]
+    values_sql = ",".join(f"('{d}')" for d in dates)
+    run_command(
+        f"INSERT INTO test_bc_partition.tbl VALUES {values_sql};",
+        pg_conn,
+    )
+
+    # use count(*) to avoid psycopg2 issues with BC date objects
+    filter_tests = [
+        ("col_date = '4712-01-01 BC'", 1, 1),
+        ("col_date = '0001-01-01 BC'", 1, 1),
+        ("col_date = '2021-01-01'", 1, 1),
+        ("col_date <= '0001-01-01 BC'", 3, 3),
+        ("col_date >= '0001-01-01'", 3, 3),
+        ("col_date BETWEEN '4712-01-01 BC' AND '0001-01-01 BC'", 3, 3),
+        ("col_date BETWEEN '0001-01-01' AND '2021-01-01'", 3, 3),
+        ("col_date BETWEEN '4712-01-01 BC' AND '2021-01-01'", 6, 6),
+        ("col_date = '9999-01-01'", 0, 0),
+        ("col_date > '2021-01-01'", 0, 1),
+    ]
+
+    for sql, expected_rows, expected_files in filter_tests:
+        plan = run_query(
+            f"{explain_prefix} SELECT * FROM test_bc_partition.tbl WHERE {sql}",
+            pg_conn,
+        )
+        assert fetch_data_files_used(plan) == str(expected_files), f"files: {sql}"
+
+        count = run_query(
+            f"SELECT count(*) FROM test_bc_partition.tbl WHERE {sql};",
+            pg_conn,
+        )
+        assert count[0][0] == expected_rows, f"rows: {sql}"
+
     run_command("RESET TIME ZONE;", pg_conn)
     pg_conn.rollback()
 
@@ -1802,6 +1918,126 @@ def test_pruning_for_coercions_temporal(
         )
         assert int(fetch_data_files_used(results)) == 1
 
+    pg_conn.rollback()
+
+
+clamped_inf_col_types = ["date", "timestamp", "timestamptz"]
+clamped_inf_partition_types = ["year", "month", "day"]
+
+
+@pytest.mark.parametrize("partition_by", clamped_inf_partition_types)
+@pytest.mark.parametrize("col_type", clamped_inf_col_types)
+def test_clamped_infinity_partition_pruning(
+    s3,
+    disable_data_file_pruning,
+    pg_conn,
+    extension,
+    with_default_location,
+    col_type,
+    partition_by,
+):
+    """Verify partition pruning works correctly with clamped +-infinity values."""
+
+    explain_prefix = "EXPLAIN (analyze, verbose, format json) "
+
+    run_command(
+        f"""
+        CREATE SCHEMA test_clamp_inf_part;
+        CREATE TABLE test_clamp_inf_part.tbl (
+            col_val {col_type}
+        ) USING iceberg
+        WITH (
+            autovacuum_enabled = 'False',
+            partition_by       = '{partition_by}(col_val)'
+        );
+        SET TIME ZONE 'UTC';
+        SET pg_lake_iceberg.out_of_range_values = 'clamp';
+    """,
+        pg_conn,
+    )
+
+    if col_type == "date":
+        normal_vals = ["2020-01-15", "2021-06-20"]
+    elif col_type == "timestamp":
+        normal_vals = ["2020-01-15 10:00:00", "2021-06-20 12:30:00"]
+    else:
+        normal_vals = ["2020-01-15 10:00:00+00", "2021-06-20 12:30:00+00"]
+
+    all_vals = normal_vals + ["infinity", "-infinity"]
+    values_sql = ",".join(f"('{v}')" for v in all_vals)
+    run_command(
+        f"INSERT INTO test_clamp_inf_part.tbl VALUES {values_sql};",
+        pg_conn,
+    )
+
+    # 4 rows in 4 different partitions → 4 data files
+
+    # Full scan → 4 files
+    plan = run_query(
+        f"{explain_prefix} SELECT count(*) FROM test_clamp_inf_part.tbl",
+        pg_conn,
+    )
+    assert fetch_data_files_used(plan) == "4"
+
+    count = run_query("SELECT count(*) FROM test_clamp_inf_part.tbl;", pg_conn)
+    assert count[0][0] == 4
+
+    # Exact match on a normal value → 1 file
+    if col_type == "date":
+        eq_filter = "col_val = '2020-01-15'"
+    elif col_type == "timestamp":
+        eq_filter = "col_val = '2020-01-15 10:00:00'"
+    else:
+        eq_filter = "col_val = '2020-01-15 10:00:00+00'"
+
+    plan = run_query(
+        f"{explain_prefix} SELECT * FROM test_clamp_inf_part.tbl WHERE {eq_filter}",
+        pg_conn,
+    )
+    assert fetch_data_files_used(plan) == "1", f"eq: {eq_filter}"
+
+    # Year >= 9999 → only the clamped +infinity partition
+    if col_type == "date":
+        hi_filter = "col_val >= '9999-01-01'"
+    elif col_type == "timestamp":
+        hi_filter = "col_val >= '9999-01-01 00:00:00'"
+    else:
+        hi_filter = "col_val >= '9999-01-01 00:00:00+00'"
+
+    plan = run_query(
+        f"{explain_prefix} SELECT * FROM test_clamp_inf_part.tbl WHERE {hi_filter}",
+        pg_conn,
+    )
+    assert fetch_data_files_used(plan) == "1", f"hi: {hi_filter}"
+
+    count = run_query(
+        f"SELECT count(*) FROM test_clamp_inf_part.tbl WHERE {hi_filter};",
+        pg_conn,
+    )
+    assert count[0][0] == 1
+
+    # Lower bound → only the clamped -infinity partition
+    if col_type == "date":
+        lo_filter = "col_val <= '4000-01-01 BC'"
+    elif col_type == "timestamp":
+        lo_filter = "col_val <= '0001-12-31 23:59:59'"
+    else:
+        lo_filter = "col_val <= '0001-12-31 23:59:59+00'"
+
+    plan = run_query(
+        f"{explain_prefix} SELECT * FROM test_clamp_inf_part.tbl WHERE {lo_filter}",
+        pg_conn,
+    )
+    assert fetch_data_files_used(plan) == "1", f"lo: {lo_filter}"
+
+    count = run_query(
+        f"SELECT count(*) FROM test_clamp_inf_part.tbl WHERE {lo_filter};",
+        pg_conn,
+    )
+    assert count[0][0] == 1
+
+    run_command("RESET pg_lake_iceberg.out_of_range_values;", pg_conn)
+    run_command("RESET TIME ZONE;", pg_conn)
     pg_conn.rollback()
 
 

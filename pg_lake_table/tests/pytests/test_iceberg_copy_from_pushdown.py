@@ -561,3 +561,467 @@ def copy_from_pushdown_setup(superuser_conn):
         superuser_conn,
     )
     superuser_conn.commit()
+
+
+def test_bc_dates_copy_from_pushdown(
+    pg_conn,
+    extension,
+    s3,
+    with_default_location,
+):
+    """Verify BC dates roundtrip correctly through COPY FROM pushdown.
+
+    COPY iceberg_table FROM 'file.parquet' goes through WriteQueryResultTo,
+    bypassing PGDuckSerialize.  This test ensures BC dates in a Parquet file
+    are correctly written to the Iceberg table via the pushed-down path.
+    """
+    parquet_url = f"s3://{TEST_BUCKET}/test_bc_copy_from_pushdown/data.parquet"
+
+    run_command("SET TIME ZONE 'UTC';", pg_conn)
+
+    # Write BC dates to a Parquet file
+    run_command(
+        f"""COPY (
+            SELECT '4712-01-01 BC'::date      AS col_date,
+                   '0001-01-01 00:00:00'::timestamp AS col_ts,
+                   '0001-01-01 00:00:00+00'::timestamptz AS col_tstz
+            UNION ALL
+            SELECT '0001-01-01 BC'::date,
+                   '0001-06-15 12:30:00'::timestamp,
+                   '0001-06-15 12:30:00+00'::timestamptz
+            UNION ALL
+            SELECT '2021-01-01'::date,
+                   '2021-01-01 00:00:00'::timestamp,
+                   '2021-01-01 00:00:00+00'::timestamptz
+        ) TO '{parquet_url}';""",
+        pg_conn,
+    )
+
+    run_command(
+        """CREATE TABLE test_bc_copy_target (
+            col_date date,
+            col_ts timestamp,
+            col_tstz timestamptz
+        ) USING iceberg;""",
+        pg_conn,
+    )
+    pg_conn.commit()
+
+    # COPY FROM pushdown
+    run_command(f"COPY test_bc_copy_target FROM '{parquet_url}';", pg_conn)
+    pg_conn.commit()
+
+    result = run_query(
+        "SELECT col_date::text AS d, col_ts::text AS ts, col_tstz::text AS tstz "
+        "FROM test_bc_copy_target ORDER BY col_date;",
+        pg_conn,
+    )
+
+    assert normalize_bc(result) == [
+        ["4712-01-01 BC", "0001-01-01 00:00:00", "0001-01-01 00:00:00+00"],
+        ["0001-01-01 BC", "0001-06-15 12:30:00", "0001-06-15 12:30:00+00"],
+        ["2021-01-01", "2021-01-01 00:00:00", "2021-01-01 00:00:00+00"],
+    ]
+
+    run_command("RESET TIME ZONE;", pg_conn)
+    run_command("DROP TABLE test_bc_copy_target;", pg_conn)
+    pg_conn.commit()
+
+
+@pytest.mark.parametrize(
+    "col_type,value,expected_err",
+    [
+        # date: year 10000 AD exceeds Iceberg's 9999 upper bound
+        ("date", "10000-01-01", "date out of range for Iceberg"),
+        # timestamp: BC timestamps are not allowed (min is 0001-01-01 AD)
+        (
+            "timestamp",
+            "0001-01-01 00:00:00 BC",
+            "timestamp out of range for Iceberg",
+        ),
+        # timestamptz: BC timestamps are not allowed
+        (
+            "timestamptz",
+            "0001-01-01 00:00:00+00 BC",
+            "timestamp out of range for Iceberg",
+        ),
+    ],
+)
+def test_temporal_out_of_range_copy_from_pushdown(
+    pg_conn,
+    extension,
+    s3,
+    with_default_location,
+    col_type,
+    value,
+    expected_err,
+):
+    """Verify out-of-range temporal values are rejected during COPY FROM pushdown.
+
+    The WrapQueryWithIcebergTemporalValidation wrapper in WriteQueryResultTo
+    adds DuckDB-side range checks that call error() for out-of-range values.
+    """
+    schema = f"test_oor_cf_{col_type.replace(' ', '_')}"
+    parquet_url = (
+        f"s3://{TEST_BUCKET}/test_temporal_oor_copy_pushdown_{col_type}/data.parquet"
+    )
+
+    run_command(f"CREATE SCHEMA {schema};", pg_conn)
+    run_command(f"SET search_path TO {schema};", pg_conn)
+    run_command("SET TIME ZONE 'UTC';", pg_conn)
+
+    try:
+        # Write an out-of-range value to a Parquet file
+        run_command(
+            f"COPY (SELECT '{value}'::{col_type} AS col) TO '{parquet_url}';",
+            pg_conn,
+        )
+
+        # Create the target Iceberg table
+        run_command(
+            f"CREATE TABLE oor_copy_target (col {col_type}) USING iceberg;",
+            pg_conn,
+        )
+        pg_conn.commit()
+
+        # COPY FROM pushdown should reject the out-of-range value
+        with pytest.raises(Exception, match=expected_err):
+            run_command(
+                f"COPY oor_copy_target FROM '{parquet_url}';",
+                pg_conn,
+            )
+        pg_conn.rollback()
+    finally:
+        run_command("RESET TIME ZONE;", pg_conn)
+        run_command("RESET search_path;", pg_conn)
+        run_command(f"DROP SCHEMA IF EXISTS {schema} CASCADE;", pg_conn)
+        pg_conn.commit()
+
+
+def test_nested_temporal_out_of_range_struct_copy_from_pushdown(
+    pg_conn,
+    extension,
+    s3,
+    with_default_location,
+):
+    """Verify out-of-range date inside a struct is rejected during COPY FROM pushdown."""
+    schema = "test_nested_oor_cf_struct"
+    parquet_url = f"s3://{TEST_BUCKET}/test_nested_oor_cf_struct/data.parquet"
+
+    run_command(f"CREATE SCHEMA {schema};", pg_conn)
+    run_command(f"SET search_path TO {schema};", pg_conn)
+
+    try:
+        run_command("CREATE TYPE event_cf AS (id int, happened_at date);", pg_conn)
+        pg_conn.commit()
+
+        # Write a struct with an out-of-range date to a Parquet file
+        run_command(
+            f"COPY (SELECT row(1, '10000-01-01'::date)::event_cf AS col) "
+            f"TO '{parquet_url}';",
+            pg_conn,
+        )
+
+        run_command(
+            "CREATE TABLE oor_copy_target (col event_cf) USING iceberg;", pg_conn
+        )
+        pg_conn.commit()
+
+        # COPY FROM pushdown should reject the out-of-range date inside the struct
+        with pytest.raises(Exception, match="date out of range for Iceberg"):
+            run_command(
+                f"COPY oor_copy_target FROM '{parquet_url}';",
+                pg_conn,
+            )
+        pg_conn.rollback()
+    finally:
+        run_command("RESET search_path;", pg_conn)
+        run_command(f"DROP SCHEMA IF EXISTS {schema} CASCADE;", pg_conn)
+        pg_conn.commit()
+
+
+def test_nested_temporal_out_of_range_map_copy_from_pushdown(
+    pg_conn,
+    extension,
+    s3,
+    with_default_location,
+):
+    """Verify out-of-range timestamp in map values is rejected during COPY FROM pushdown."""
+    schema = "test_nested_oor_cf_map"
+    parquet_url = f"s3://{TEST_BUCKET}/test_nested_oor_cf_map/data.parquet"
+
+    run_command(f"CREATE SCHEMA {schema};", pg_conn)
+    run_command(f"SET search_path TO {schema};", pg_conn)
+    run_command("SET TIME ZONE 'UTC';", pg_conn)
+
+    try:
+        map_type = create_map_type("text", "timestamp")
+        pg_conn.commit()
+
+        # Write a map with an out-of-range timestamp value to a Parquet file
+        run_command(
+            f"COPY (SELECT ARRAY[('key1', '0001-01-01 00:00:00 BC'::timestamp)]"
+            f"::{map_type} AS col) TO '{parquet_url}';",
+            pg_conn,
+        )
+
+        run_command(
+            f"CREATE TABLE oor_copy_target (col {map_type}) USING iceberg;", pg_conn
+        )
+        pg_conn.commit()
+
+        # COPY FROM pushdown should reject the out-of-range timestamp in the map
+        with pytest.raises(Exception, match="timestamp out of range for Iceberg"):
+            run_command(
+                f"COPY oor_copy_target FROM '{parquet_url}';",
+                pg_conn,
+            )
+        pg_conn.rollback()
+    finally:
+        run_command("RESET TIME ZONE;", pg_conn)
+        run_command("RESET search_path;", pg_conn)
+        run_command(f"DROP SCHEMA IF EXISTS {schema} CASCADE;", pg_conn)
+        pg_conn.commit()
+
+
+def test_nested_temporal_out_of_range_array_of_struct_copy_from_pushdown(
+    pg_conn,
+    extension,
+    s3,
+    with_default_location,
+):
+    """Verify out-of-range date inside an array of structs is rejected during COPY FROM pushdown."""
+    schema = "test_nested_oor_cf_arr_struct"
+    parquet_url = f"s3://{TEST_BUCKET}/test_nested_oor_cf_arr_struct/data.parquet"
+
+    run_command(f"CREATE SCHEMA {schema};", pg_conn)
+    run_command(f"SET search_path TO {schema};", pg_conn)
+
+    try:
+        run_command("CREATE TYPE log_entry_cf AS (msg text, logged_at date);", pg_conn)
+        pg_conn.commit()
+
+        # Write an array of structs with an out-of-range date to a Parquet file
+        run_command(
+            f"COPY (SELECT ARRAY[row('ok', '2021-01-01'::date)::log_entry_cf, "
+            f"row('bad', '10000-01-01'::date)::log_entry_cf] AS col) "
+            f"TO '{parquet_url}';",
+            pg_conn,
+        )
+
+        run_command(
+            "CREATE TABLE oor_copy_target (col log_entry_cf[]) USING iceberg;",
+            pg_conn,
+        )
+        pg_conn.commit()
+
+        # COPY FROM pushdown should reject the out-of-range date in the struct array
+        with pytest.raises(Exception, match="date out of range for Iceberg"):
+            run_command(
+                f"COPY oor_copy_target FROM '{parquet_url}';",
+                pg_conn,
+            )
+        pg_conn.rollback()
+    finally:
+        run_command("RESET search_path;", pg_conn)
+        run_command(f"DROP SCHEMA IF EXISTS {schema} CASCADE;", pg_conn)
+        pg_conn.commit()
+
+
+@pytest.mark.parametrize(
+    "col_type,value,expected_clamped",
+    [
+        # date: year 10000 AD exceeds upper bound → clamped to 9999-12-31
+        ("date", "10000-01-01", "9999-12-31"),
+        # timestamp: BC below lower bound → clamped to 0001-01-01 00:00:00
+        (
+            "timestamp",
+            "0001-01-01 00:00:00 BC",
+            "0001-01-01 00:00:00",
+        ),
+        # timestamptz: BC below lower bound → clamped to 0001-01-01 00:00:00+00
+        (
+            "timestamptz",
+            "0001-01-01 00:00:00+00 BC",
+            "0001-01-01 00:00:00+00",
+        ),
+    ],
+)
+def test_temporal_out_of_range_clamp_copy_from_pushdown(
+    pg_conn,
+    extension,
+    s3,
+    with_default_location,
+    col_type,
+    value,
+    expected_clamped,
+):
+    """Verify out-of-range temporal values are clamped during COPY FROM pushdown.
+
+    When pg_lake_iceberg.out_of_range_values = 'clamp', the temporal
+    validation wrapper clamps values to the nearest Iceberg boundary instead
+    of raising an error.
+    """
+    schema = f"test_oor_clamp_cf_{col_type.replace(' ', '_')}"
+    parquet_url = f"s3://{TEST_BUCKET}/test_temporal_oor_clamp_copy_pushdown_{col_type}/data.parquet"
+
+    run_command(f"CREATE SCHEMA {schema};", pg_conn)
+    run_command(f"SET search_path TO {schema};", pg_conn)
+    run_command("SET TIME ZONE 'UTC';", pg_conn)
+    run_command("SET pg_lake_iceberg.out_of_range_values = 'clamp';", pg_conn)
+
+    try:
+        # Write an out-of-range value to a Parquet file
+        run_command(
+            f"COPY (SELECT '{value}'::{col_type} AS col) TO '{parquet_url}';",
+            pg_conn,
+        )
+
+        # Create the target Iceberg table
+        run_command(
+            f"CREATE TABLE oor_copy_target (col {col_type}) USING iceberg;",
+            pg_conn,
+        )
+        pg_conn.commit()
+
+        # COPY FROM pushdown should succeed with clamping
+        run_command(
+            f"COPY oor_copy_target FROM '{parquet_url}';",
+            pg_conn,
+        )
+        pg_conn.commit()
+
+        # Read back and verify the clamped value
+        result = run_query(
+            "SELECT col::text FROM oor_copy_target;",
+            pg_conn,
+        )
+        assert result[0][0] == expected_clamped
+    finally:
+        run_command("RESET pg_lake_iceberg.out_of_range_values;", pg_conn)
+        run_command("RESET TIME ZONE;", pg_conn)
+        run_command("RESET search_path;", pg_conn)
+        run_command(f"DROP SCHEMA IF EXISTS {schema} CASCADE;", pg_conn)
+        pg_conn.commit()
+
+
+@pytest.mark.parametrize(
+    "col_type,value,expected_err",
+    [
+        ("date", "infinity", "date out of range for Iceberg"),
+        ("date", "-infinity", "date out of range for Iceberg"),
+        ("timestamp", "infinity", "timestamp out of range for Iceberg"),
+        ("timestamp", "-infinity", "timestamp out of range for Iceberg"),
+        ("timestamptz", "infinity", "timestamp out of range for Iceberg"),
+        ("timestamptz", "-infinity", "timestamp out of range for Iceberg"),
+    ],
+)
+def test_infinity_temporal_error_copy_from_pushdown(
+    pg_conn,
+    extension,
+    s3,
+    with_default_location,
+    col_type,
+    value,
+    expected_err,
+):
+    """Verify +-infinity temporal values are rejected during COPY FROM pushdown."""
+    schema = f"test_inf_err_cf_{col_type.replace(' ', '_')}"
+    parquet_url = f"s3://{TEST_BUCKET}/test_inf_temporal_err_copy_pushdown_{col_type}/data.parquet"
+
+    run_command(f"CREATE SCHEMA {schema};", pg_conn)
+    run_command(f"SET search_path TO {schema};", pg_conn)
+    run_command("SET TIME ZONE 'UTC';", pg_conn)
+
+    try:
+        # Write an infinity value to a Parquet file
+        run_command(
+            f"COPY (SELECT '{value}'::{col_type} AS col) TO '{parquet_url}';",
+            pg_conn,
+        )
+
+        # Create the target Iceberg table
+        run_command(
+            f"CREATE TABLE inf_copy_target (col {col_type}) USING iceberg;",
+            pg_conn,
+        )
+        pg_conn.commit()
+
+        # COPY FROM pushdown should reject the infinity value
+        with pytest.raises(Exception, match=expected_err):
+            run_command(
+                f"COPY inf_copy_target FROM '{parquet_url}';",
+                pg_conn,
+            )
+        pg_conn.rollback()
+    finally:
+        run_command("RESET TIME ZONE;", pg_conn)
+        run_command("RESET search_path;", pg_conn)
+        run_command(f"DROP SCHEMA IF EXISTS {schema} CASCADE;", pg_conn)
+        pg_conn.commit()
+
+
+@pytest.mark.parametrize(
+    "col_type,value,expected_clamped",
+    [
+        ("date", "infinity", "9999-12-31"),
+        ("date", "-infinity", "4713-01-01 BC"),
+        ("timestamp", "infinity", "9999-12-31 23:59:59.999999"),
+        ("timestamp", "-infinity", "0001-01-01 00:00:00"),
+        ("timestamptz", "infinity", "9999-12-31 23:59:59.999999+00"),
+        ("timestamptz", "-infinity", "0001-01-01 00:00:00+00"),
+    ],
+)
+def test_infinity_temporal_clamp_copy_from_pushdown(
+    pg_conn,
+    extension,
+    s3,
+    with_default_location,
+    col_type,
+    value,
+    expected_clamped,
+):
+    """Verify +-infinity temporal values are clamped during COPY FROM pushdown."""
+    schema = f"test_inf_clamp_cf_{col_type.replace(' ', '_')}"
+    parquet_url = f"s3://{TEST_BUCKET}/test_inf_temporal_clamp_copy_pushdown_{col_type}/data.parquet"
+
+    run_command(f"CREATE SCHEMA {schema};", pg_conn)
+    run_command(f"SET search_path TO {schema};", pg_conn)
+    run_command("SET TIME ZONE 'UTC';", pg_conn)
+    run_command("SET pg_lake_iceberg.out_of_range_values = 'clamp';", pg_conn)
+
+    try:
+        # Write an infinity value to a Parquet file
+        run_command(
+            f"COPY (SELECT '{value}'::{col_type} AS col) TO '{parquet_url}';",
+            pg_conn,
+        )
+
+        # Create the target Iceberg table
+        run_command(
+            f"CREATE TABLE inf_copy_target (col {col_type}) USING iceberg;",
+            pg_conn,
+        )
+        pg_conn.commit()
+
+        # COPY FROM pushdown should succeed with clamping
+        run_command(
+            f"COPY inf_copy_target FROM '{parquet_url}';",
+            pg_conn,
+        )
+        pg_conn.commit()
+
+        # Read back and verify the clamped value
+        # The ::text cast may execute inside DuckDB (query pushdown), which
+        # formats BC as "(BC)".  Normalize to PostgreSQL's " BC" for comparison.
+        result = run_query(
+            "SELECT col::text FROM inf_copy_target;",
+            pg_conn,
+        )
+        assert normalize_bc(result)[0][0] == expected_clamped
+    finally:
+        run_command("RESET pg_lake_iceberg.out_of_range_values;", pg_conn)
+        run_command("RESET TIME ZONE;", pg_conn)
+        run_command("RESET search_path;", pg_conn)
+        run_command(f"DROP SCHEMA IF EXISTS {schema} CASCADE;", pg_conn)
+        pg_conn.commit()

@@ -37,8 +37,10 @@
 #include "pg_lake/util/numeric.h"
 #include "nodes/pg_list.h"
 #include "utils/builtins.h"
+#include "pg_lake/pgduck/map.h"
 #include "pg_lake/pgduck/parse_struct.h"
 #include "utils/lsyscache.h"
+#include "utils/typcache.h"
 
 static char *TupleDescToProjectionListForWrite(TupleDesc tupleDesc,
 											   CopyDataFormat destinationFormat);
@@ -46,6 +48,26 @@ static DuckDBTypeInfo ChooseDuckDBEngineTypeForWrite(PGType postgresType,
 													 CopyDataFormat destinationFormat);
 static void AppendFieldIdValue(StringInfo map, Field * field, int fieldId);
 static const char *ParquetVersionToString(ParquetVersion version);
+static char *WrapQueryWithIcebergTemporalValidation(char *query,
+													TupleDesc tupleDesc);
+static const char *GetTemporalMinLiteral(Oid typeOid);
+static const char *GetTemporalMaxLiteral(Oid typeOid);
+static char *WrapQueryWithIcebergNumericValidation(char *query,
+												   TupleDesc tupleDesc);
+static char *NeutralizeNumericCastsInQuery(char *query);
+static const char *GetNumericMaxLiteral(int precision, int scale);
+static void AppendNumericNaNAction(StringInfo buf, const char *expr,
+								   int precision, int scale);
+static void AppendNumericOutOfRangeAction(StringInfo buf, const char *expr,
+										  int precision, int scale,
+										  const char *errMsg);
+static void AppendNumericValidationCaseExpr(StringInfo buf, const char *expr,
+											int typmod);
+static void AppendNumericValidationExpr(StringInfo buf, const char *expr,
+										const char *alias, int typmod);
+static void AppendNumericArrayValidationExpr(StringInfo buf, const char *expr,
+											 const char *alias, int typmod);
+static bool IsNumericArrayType(Oid typeOid);
 
 static DuckDBTypeInfo VARCHAR_TYPE =
 {
@@ -54,6 +76,7 @@ static DuckDBTypeInfo VARCHAR_TYPE =
 
 int			TargetRowGroupSizeMB = DEFAULT_TARGET_ROW_GROUP_SIZE_MB;
 int			DefaultParquetVersion = PARQUET_VERSION_V1;
+int			IcebergOutOfRangeValues = ICEBERG_OUT_OF_RANGE_ERROR;
 
 
 /*
@@ -120,6 +143,19 @@ WriteQueryResultTo(char *query,
 				   TupleDesc queryTupleDesc,
 				   List *leafFields)
 {
+	/*
+	 * For Iceberg, wrap the query with temporal range validation.
+	 *
+	 * All writes (direct INSERT, INSERT..SELECT, COPY FROM) flow through
+	 * here.  This wrapper ensures out-of-range temporal values are rejected
+	 * at the DuckDB level before being written to Parquet files.
+	 */
+	if (destinationFormat == DATA_FORMAT_ICEBERG)
+	{
+		query = WrapQueryWithIcebergTemporalValidation(query, queryTupleDesc);
+		query = WrapQueryWithIcebergNumericValidation(query, queryTupleDesc);
+	}
+
 	StringInfoData command;
 
 	initStringInfo(&command);
@@ -633,7 +669,8 @@ ChooseDuckDBEngineTypeForWrite(PGType postgresType,
 
 		GetDuckdbAdjustedPrecisionAndScaleFromNumericTypeMod(postgresTypeMod, &precision, &scale);
 
-		if (CanPushdownNumericToDuckdb(precision, scale))
+		if (CanPushdownNumericToDuckdb(precision, scale) &&
+			destinationFormat != DATA_FORMAT_ICEBERG)
 		{
 			/*
 			 * happy case: we can map to DECIMAL(precision, scale)
@@ -642,7 +679,12 @@ ChooseDuckDBEngineTypeForWrite(PGType postgresType,
 		}
 		else
 		{
-			/* explicit precision which is too big for us */
+			/*
+			 * Read numeric as VARCHAR.  For Iceberg, the numeric validation
+			 * wrapper will validate NaN/Inf and digit limits before casting
+			 * to DECIMAL (for both scalars and arrays). For other cases, the
+			 * precision is too big for DuckDB's DECIMAL type.
+			 */
 			duckTypeId = DUCKDB_TYPE_VARCHAR;
 		}
 	}
@@ -721,4 +763,922 @@ ChooseDuckDBEngineTypeForWrite(PGType postgresType,
 	};
 
 	return typeInfo;
+}
+
+
+/*
+ * IsTemporalType returns true if the given type OID is a date,
+ * timestamp, or timestamptz type.
+ */
+static bool
+IsTemporalType(Oid typeOid)
+{
+	return typeOid == DATEOID ||
+		typeOid == TIMESTAMPOID ||
+		typeOid == TIMESTAMPTZOID;
+}
+
+
+/*
+ * TypeContainsTemporal recursively checks whether a PostgreSQL type
+ * contains any date/timestamp/timestamptz fields, including fields
+ * nested inside structs, maps, and arrays.
+ */
+static bool
+TypeContainsTemporal(Oid typeOid)
+{
+	if (IsTemporalType(typeOid))
+		return true;
+
+	/* array: check element type */
+	Oid			elemType = get_element_type(typeOid);
+
+	if (OidIsValid(elemType))
+		return TypeContainsTemporal(elemType);
+
+	/* map: check key and value types */
+	if (IsMapTypeOid(typeOid))
+	{
+		PGType		keyType = GetMapKeyType(typeOid);
+		PGType		valueType = GetMapValueType(typeOid);
+
+		return TypeContainsTemporal(keyType.postgresTypeOid) ||
+			TypeContainsTemporal(valueType.postgresTypeOid);
+	}
+
+	/* composite/struct: check each field */
+	if (get_typtype(typeOid) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	tupdesc = lookup_rowtype_tupdesc(typeOid, -1);
+
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+			if (att->attisdropped)
+				continue;
+
+			if (TypeContainsTemporal(att->atttypid))
+			{
+				ReleaseTupleDesc(tupdesc);
+				return true;
+			}
+		}
+
+		ReleaseTupleDesc(tupdesc);
+	}
+
+	return false;
+}
+
+
+/*
+ * AppendTemporalRangeCheck appends a DuckDB boolean expression that
+ * checks whether a single scalar temporal expression is out of range
+ * or +-infinity.
+ *
+ * Returns true if the expression is out of range, which callers use
+ * to trigger error() or clamping.  Does NOT include a NULL check —
+ * callers handle NULL propagation.
+ *
+ * The isfinite() check comes first so that year() is never evaluated
+ * on an infinite value, which would be undefined in DuckDB.
+ */
+static void
+AppendTemporalRangeCheck(StringInfo buf, const char *expr, Oid typeOid)
+{
+	Assert(IsTemporalType(typeOid));
+
+	if (typeOid == DATEOID)
+	{
+		appendStringInfo(buf,
+						 "(NOT isfinite(%s) OR year(%s) < -4712 OR year(%s) > 9999)",
+						 expr, expr, expr);
+	}
+	else if (typeOid == TIMESTAMPTZOID)
+	{
+		/*
+		 * DuckDB's ICU-based year() for TIMESTAMPTZ returns the era-based
+		 * year (always positive, e.g. 1 for 1 BC) rather than the ISO year (0
+		 * for 1 BC).  Cast to TIMESTAMP first so the core year() function is
+		 * used, which returns the correct astronomical year.
+		 */
+		appendStringInfo(buf,
+						 "(NOT isfinite(%s) OR year(%s::TIMESTAMP) < 1 OR year(%s::TIMESTAMP) > 9999)",
+						 expr, expr, expr);
+	}
+	else
+	{
+		/* TIMESTAMPOID */
+		appendStringInfo(buf,
+						 "(NOT isfinite(%s) OR year(%s) < 1 OR year(%s) > 9999)",
+						 expr, expr, expr);
+	}
+}
+
+
+/*
+ * AppendTemporalLowerBoundCheck appends a DuckDB boolean expression that
+ * checks whether a scalar temporal expression is below the lower bound
+ * of Iceberg's supported range.
+ *
+ * Uses a direct comparison against the min literal, which correctly
+ * handles +-infinity: -infinity < min is true → clamp to min,
+ * +infinity < min is false → clamp to max.
+ */
+static void
+AppendTemporalLowerBoundCheck(StringInfo buf, const char *expr, Oid typeOid)
+{
+	Assert(IsTemporalType(typeOid));
+
+	appendStringInfo(buf, "%s < %s", expr, GetTemporalMinLiteral(typeOid));
+}
+
+
+/*
+ * GetTemporalMinLiteral returns the DuckDB literal for the minimum
+ * supported temporal value in Iceberg for the given type.
+ */
+static const char *
+GetTemporalMinLiteral(Oid typeOid)
+{
+	if (typeOid == DATEOID)
+		return "DATE '-4712-01-01'";
+	if (typeOid == TIMESTAMPTZOID)
+		return "TIMESTAMPTZ '0001-01-01 00:00:00+00'";
+	return "TIMESTAMP '0001-01-01 00:00:00'";
+}
+
+
+/*
+ * GetTemporalMaxLiteral returns the DuckDB literal for the maximum
+ * supported temporal value in Iceberg for the given type.
+ */
+static const char *
+GetTemporalMaxLiteral(Oid typeOid)
+{
+	if (typeOid == DATEOID)
+		return "DATE '9999-12-31'";
+	if (typeOid == TIMESTAMPTZOID)
+		return "TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'";
+	return "TIMESTAMP '9999-12-31 23:59:59.999999'";
+}
+
+
+/*
+ * AppendTemporalOutOfRangeAction appends the THEN clause for an
+ * out-of-range or infinite temporal value.
+ *
+ * In error mode, emits: error('...')
+ * In clamp mode, emits: CASE WHEN (lower_check) THEN min ELSE max END
+ */
+static void
+AppendTemporalOutOfRangeAction(StringInfo buf, const char *expr, Oid typeOid)
+{
+	if (IcebergOutOfRangeValues == ICEBERG_OUT_OF_RANGE_CLAMP)
+	{
+		appendStringInfoString(buf, "CASE WHEN ");
+		AppendTemporalLowerBoundCheck(buf, expr, typeOid);
+		appendStringInfo(buf, " THEN %s ELSE %s END",
+						 GetTemporalMinLiteral(typeOid),
+						 GetTemporalMaxLiteral(typeOid));
+	}
+	else
+	{
+		const char *errMsg = (typeOid == DATEOID) ?
+			"date out of range for Iceberg" :
+			"timestamp out of range for Iceberg";
+
+		appendStringInfo(buf, "error('%s')", errMsg);
+	}
+}
+
+
+/*
+ * AppendTemporalValidationExpr appends a DuckDB CASE expression that
+ * validates a scalar temporal value against Iceberg's supported range.
+ *
+ * In error mode (default), out-of-range values cause DuckDB's error()
+ * to throw, which propagates back to PostgreSQL as an ereport(ERROR).
+ *
+ * In clamp mode, out-of-range values are clamped to the nearest
+ * valid boundary value.
+ */
+static void
+AppendTemporalValidationExpr(StringInfo buf, const char *expr,
+							 const char *alias, Oid typeOid)
+{
+	appendStringInfo(buf, "CASE WHEN %s IS NOT NULL AND ", expr);
+	AppendTemporalRangeCheck(buf, expr, typeOid);
+	appendStringInfoString(buf, " THEN ");
+	AppendTemporalOutOfRangeAction(buf, expr, typeOid);
+	appendStringInfo(buf, " ELSE %s END AS %s", expr, alias);
+}
+
+
+static void AppendValidatedColumnExpr(StringInfo buf, const char *expr,
+									  Oid typeOid, int depth);
+
+
+/*
+ * AppendValidatedListExpr wraps array/list elements with temporal
+ * validation using DuckDB's list_transform().
+ *
+ * The 'depth' parameter is used to generate unique lambda variable
+ * names (__v0, __v1, ...) to avoid collisions in nested lambdas.
+ */
+static void
+AppendValidatedListExpr(StringInfo buf, const char *expr,
+						Oid elemTypeOid, int depth)
+{
+	char	   *lambdaVar = psprintf("__v%d", depth);
+	StringInfoData lambdaBody;
+
+	initStringInfo(&lambdaBody);
+	AppendValidatedColumnExpr(&lambdaBody, lambdaVar, elemTypeOid, depth + 1);
+
+	appendStringInfo(buf, "list_transform(%s, %s -> %s)",
+					 expr, lambdaVar, lambdaBody.data);
+
+	pfree(lambdaBody.data);
+	pfree(lambdaVar);
+}
+
+
+/*
+ * AppendValidatedColumnExpr recursively appends a DuckDB expression
+ * that validates all temporal fields within a value of the given type.
+ *
+ * Handles:
+ *   - Scalar temporal types (date, timestamp, timestamptz)
+ *   - Arrays of any type containing temporal fields
+ *   - Structs with temporal fields at any nesting depth
+ *   - Maps whose values contain temporal fields
+ *
+ * In error mode, raises an error (via DuckDB's error() function) for
+ * out-of-range temporal values.  In clamp mode, clamps them to the
+ * nearest valid boundary value.
+ */
+static void
+AppendValidatedColumnExpr(StringInfo buf, const char *expr,
+						  Oid typeOid, int depth)
+{
+	if (IsTemporalType(typeOid))
+	{
+		appendStringInfo(buf, "CASE WHEN %s IS NOT NULL AND ", expr);
+		AppendTemporalRangeCheck(buf, expr, typeOid);
+		appendStringInfoString(buf, " THEN ");
+		AppendTemporalOutOfRangeAction(buf, expr, typeOid);
+		appendStringInfo(buf, " ELSE %s END", expr);
+		return;
+	}
+
+	/* array: validate each element */
+	Oid			elemType = get_element_type(typeOid);
+
+	if (OidIsValid(elemType) && TypeContainsTemporal(elemType))
+	{
+		AppendValidatedListExpr(buf, expr, elemType, depth);
+		return;
+	}
+
+	/* map: validate keys and/or values via map_entries + list_transform */
+	if (IsMapTypeOid(typeOid))
+	{
+		PGType		keyType = GetMapKeyType(typeOid);
+		PGType		valType = GetMapValueType(typeOid);
+		bool		keyTemporal = TypeContainsTemporal(keyType.postgresTypeOid);
+		bool		valTemporal = TypeContainsTemporal(valType.postgresTypeOid);
+
+		if (keyTemporal || valTemporal)
+		{
+			char	   *entryVar = psprintf("__v%d", depth);
+			StringInfoData keyBody;
+			StringInfoData valBody;
+
+			initStringInfo(&keyBody);
+			initStringInfo(&valBody);
+
+			if (keyTemporal)
+				AppendValidatedColumnExpr(&keyBody,
+										  psprintf("%s.key", entryVar),
+										  keyType.postgresTypeOid,
+										  depth + 1);
+			else
+				appendStringInfo(&keyBody, "%s.key", entryVar);
+
+			if (valTemporal)
+				AppendValidatedColumnExpr(&valBody,
+										  psprintf("%s.value", entryVar),
+										  valType.postgresTypeOid,
+										  depth + 1);
+			else
+				appendStringInfo(&valBody, "%s.value", entryVar);
+
+			appendStringInfo(buf,
+							 "map_from_entries(list_transform(map_entries(%s), "
+							 "%s -> struct_pack(key := %s, value := %s)))",
+							 expr, entryVar, keyBody.data, valBody.data);
+
+			pfree(keyBody.data);
+			pfree(valBody.data);
+			pfree(entryVar);
+			return;
+		}
+	}
+
+	/* composite/struct: rebuild with validated fields */
+	if (get_typtype(typeOid) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	tupdesc = lookup_rowtype_tupdesc(typeOid, -1);
+		bool		hasTemporalField = false;
+
+		/* first check if any field needs validation */
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+			if (att->attisdropped)
+				continue;
+
+			if (TypeContainsTemporal(att->atttypid))
+			{
+				hasTemporalField = true;
+				break;
+			}
+		}
+
+		if (hasTemporalField)
+		{
+			/*
+			 * Rebuild the struct with struct_pack, validating temporal
+			 * fields.
+			 */
+			appendStringInfoString(buf, "struct_pack(");
+
+			bool		first = true;
+
+			for (int i = 0; i < tupdesc->natts; i++)
+			{
+				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+				if (att->attisdropped)
+					continue;
+
+				if (!first)
+					appendStringInfoString(buf, ", ");
+				first = false;
+
+				const char *fieldName = NameStr(att->attname);
+				char	   *fieldExpr = psprintf("%s.%s", expr,
+												 quote_identifier(fieldName));
+
+				appendStringInfo(buf, "%s := ", quote_identifier(fieldName));
+
+				if (TypeContainsTemporal(att->atttypid))
+					AppendValidatedColumnExpr(buf, fieldExpr, att->atttypid,
+											  depth);
+				else
+					appendStringInfoString(buf, fieldExpr);
+
+				pfree(fieldExpr);
+			}
+
+			appendStringInfoChar(buf, ')');
+
+			ReleaseTupleDesc(tupdesc);
+			return;
+		}
+
+		ReleaseTupleDesc(tupdesc);
+	}
+
+	/* no temporal content, pass through */
+	appendStringInfoString(buf, expr);
+}
+
+
+/*
+ * WrapQueryWithIcebergTemporalValidation wraps a DuckDB query with
+ * range-checking expressions for date/timestamp/timestamptz columns
+ * when writing to Iceberg format.
+ *
+ * All writes (direct INSERT, INSERT..SELECT, COPY FROM) flow through
+ * WriteQueryResultTo, which calls this wrapper.  It ensures that
+ * out-of-range temporal values are caught at the DuckDB level before
+ * being written to Parquet data files.
+ *
+ * Handles temporal types at any nesting depth: top-level scalars,
+ * arrays, structs, and maps.
+ *
+ * If no temporal columns are found, the original query is returned as-is.
+ */
+static char *
+WrapQueryWithIcebergTemporalValidation(char *query, TupleDesc tupleDesc)
+{
+	if (tupleDesc == NULL)
+		return query;
+
+	/* quick check: any temporal columns at all? */
+	bool		hasTemporalCol = false;
+
+	for (int i = 0; i < tupleDesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
+
+		if (attr->attisdropped)
+			continue;
+
+		if (TypeContainsTemporal(attr->atttypid))
+		{
+			hasTemporalCol = true;
+			break;
+		}
+	}
+
+	if (!hasTemporalCol)
+		return query;
+
+	StringInfoData wrapped;
+
+	initStringInfo(&wrapped);
+	appendStringInfoString(&wrapped, "SELECT ");
+
+	bool		first = true;
+
+	for (int i = 0; i < tupleDesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
+
+		if (attr->attisdropped)
+			continue;
+
+		if (!first)
+			appendStringInfoString(&wrapped, ", ");
+		first = false;
+
+		const char *colName = quote_identifier(NameStr(attr->attname));
+		Oid			typeId = attr->atttypid;
+
+		if (TypeContainsTemporal(typeId))
+		{
+			if (IsTemporalType(typeId))
+			{
+				/* scalar date/timestamp/timestamptz */
+				AppendTemporalValidationExpr(&wrapped, colName, colName,
+											 typeId);
+			}
+			else
+			{
+				/*
+				 * Complex type containing temporal fields — generate a
+				 * recursive validation expression.
+				 */
+				AppendValidatedColumnExpr(&wrapped, colName, typeId, 0);
+				appendStringInfo(&wrapped, " AS %s", colName);
+			}
+		}
+		else
+		{
+			appendStringInfoString(&wrapped, colName);
+		}
+	}
+
+	appendStringInfo(&wrapped, " FROM (%s) AS __iceberg_temporal_check", query);
+
+	return wrapped.data;
+}
+
+
+/*
+ * GetNumericMaxLiteral returns the maximum positive DECIMAL(p,s) literal.
+ *
+ * For example, DECIMAL(38,9) → "99999999999999999999999999999.999999999"
+ */
+static const char *
+GetNumericMaxLiteral(int precision, int scale)
+{
+	StringInfoData result;
+	int			integralDigits = precision - scale;
+
+	initStringInfo(&result);
+
+	for (int i = 0; i < integralDigits; i++)
+		appendStringInfoChar(&result, '9');
+
+	if (scale > 0)
+	{
+		appendStringInfoChar(&result, '.');
+		for (int i = 0; i < scale; i++)
+			appendStringInfoChar(&result, '9');
+	}
+
+	return result.data;
+}
+
+
+/*
+ * AppendNumericNaNAction appends the THEN clause for a NaN value.
+ *
+ * In error mode (default), emits: error('...')
+ * In clamp mode, emits: NULL::DECIMAL(p,s) (or NULL::VARCHAR)
+ *
+ * NaN has no numeric equivalent, so we clamp to NULL.
+ */
+static void
+AppendNumericNaNAction(StringInfo buf, const char *expr, int precision,
+					   int scale)
+{
+	if (IcebergOutOfRangeValues == ICEBERG_OUT_OF_RANGE_CLAMP)
+	{
+		if (CanPushdownNumericToDuckdb(precision, scale))
+			appendStringInfo(buf, "NULL::DECIMAL(%d,%d)", precision, scale);
+		else
+			appendStringInfoString(buf, "NULL::VARCHAR");
+	}
+	else
+	{
+		appendStringInfo(buf,
+						 "error(CONCAT('NaN is not allowed for numeric type: ', "
+						 "CAST(%s AS VARCHAR)))",
+						 expr);
+	}
+}
+
+
+/*
+ * AppendNumericOutOfRangeAction appends the THEN clause for an
+ * out-of-range numeric value (Infinity or digit overflow).
+ *
+ * In error mode (default), emits: error('...')
+ * In clamp mode, emits a sign-aware expression that returns the
+ * maximum or minimum DECIMAL(p,s) literal (negative max for negative
+ * values, positive max for positive values).
+ */
+static void
+AppendNumericOutOfRangeAction(StringInfo buf, const char *expr,
+							  int precision, int scale,
+							  const char *errMsg)
+{
+	if (IcebergOutOfRangeValues == ICEBERG_OUT_OF_RANGE_CLAMP)
+	{
+		const char *maxLit = GetNumericMaxLiteral(precision, scale);
+
+		if (CanPushdownNumericToDuckdb(precision, scale))
+		{
+			appendStringInfo(buf,
+							 "CASE WHEN STARTS_WITH(LTRIM(CAST(%s AS VARCHAR)), '-') "
+							 "THEN CAST('-%s' AS DECIMAL(%d,%d)) "
+							 "ELSE CAST('%s' AS DECIMAL(%d,%d)) END",
+							 expr, maxLit, precision, scale,
+							 maxLit, precision, scale);
+		}
+		else
+		{
+			appendStringInfo(buf,
+							 "CASE WHEN STARTS_WITH(LTRIM(CAST(%s AS VARCHAR)), '-') "
+							 "THEN '-%s' ELSE '%s' END",
+							 expr, maxLit, maxLit);
+		}
+	}
+	else
+	{
+		appendStringInfo(buf,
+						 "error(CONCAT('%s: ', CAST(%s AS VARCHAR)))",
+						 errMsg, expr);
+	}
+}
+
+
+/*
+ * AppendNumericValidationCaseExpr appends a DuckDB CASE expression
+ * that validates a single numeric value for Iceberg compatibility.
+ *
+ * The generated expression can be used standalone or inside a
+ * list_transform lambda for array elements.
+ *
+ * Checks:
+ *  - NaN → error or NULL (NaN has no numeric equivalent)
+ *  - Infinity → error or clamp to min/max DECIMAL
+ *  - For unbounded numeric: integral and decimal digit limits →
+ *    error or clamp to min/max DECIMAL
+ *  - Otherwise: CAST to DECIMAL(precision, scale) (or keep VARCHAR if
+ *    the precision is too large for DuckDB)
+ *
+ * In error mode (default), invalid values raise error().
+ * In clamp mode, NaN becomes NULL and out-of-range values are clamped
+ * to the min/max DECIMAL(p,s) based on sign.
+ *
+ * Does NOT append an alias — callers add "AS alias" as needed.
+ */
+static void
+AppendNumericValidationCaseExpr(StringInfo buf, const char *expr, int typmod)
+{
+	int			precision;
+	int			scale;
+
+	GetDuckdbAdjustedPrecisionAndScaleFromNumericTypeMod(typmod, &precision, &scale);
+
+	bool		isUnbounded = IsUnboundedNumeric(NUMERICOID, typmod);
+
+	/* check for NaN */
+	appendStringInfo(buf,
+					 "CASE WHEN LOWER(TRIM(CAST(%s AS VARCHAR))) = 'nan' THEN ",
+					 expr);
+	AppendNumericNaNAction(buf, expr, precision, scale);
+
+	/* check for Infinity */
+	appendStringInfo(buf,
+					 " WHEN LOWER(TRIM(CAST(%s AS VARCHAR))) "
+					 "IN ('infinity', '+infinity', '-infinity', "
+					 "'inf', '+inf', '-inf') THEN ",
+					 expr);
+	AppendNumericOutOfRangeAction(buf, expr, precision, scale,
+								  "Infinity values are not allowed for "
+								  "numeric type");
+
+	if (isUnbounded)
+	{
+		int			maxIntegralDigits = precision - scale;
+
+		/* check integral digit count */
+		appendStringInfo(buf,
+						 " WHEN %s IS NOT NULL AND "
+						 "LENGTH(REGEXP_REPLACE(SPLIT_PART("
+						 "LTRIM(CAST(%s AS VARCHAR), '+-'), '.', 1), "
+						 "'[^0-9]', '', 'g')) > %d THEN ",
+						 expr, expr, maxIntegralDigits);
+		AppendNumericOutOfRangeAction(buf, expr, precision, scale,
+									  psprintf("unbounded numeric type exceeds max "
+											   "allowed digits %d before decimal point",
+											   maxIntegralDigits));
+
+		/*
+		 * We intentionally do NOT check the decimal digit count here. When
+		 * the PostgreSQL column is unbounded numeric, values may have more
+		 * fractional digits than the Iceberg scale (e.g. random() produces
+		 * 15+ digits).  The CAST to DECIMAL(p,s) in the ELSE branch will
+		 * round excess fractional digits, which is correct.
+		 */
+	}
+
+	if (CanPushdownNumericToDuckdb(precision, scale))
+	{
+		if (!isUnbounded)
+		{
+			/*
+			 * For bounded numerics, add explicit range checks so that
+			 * out-of-range values are caught before the final CAST. In clamp
+			 * mode this clamps to min/max; in error mode it raises a clear
+			 * error instead of a raw DuckDB conversion error.
+			 *
+			 * TRY_CAST to DECIMAL(38, target_scale) for safe comparison. This
+			 * gives up to (38 - scale) integer digits — always enough —
+			 * while preserving exact fractional precision.
+			 */
+			const char *maxLit = GetNumericMaxLiteral(precision, scale);
+
+			appendStringInfo(buf,
+							 " WHEN %s IS NOT NULL AND "
+							 "TRY_CAST(%s AS DECIMAL(38,%d)) > "
+							 "CAST('%s' AS DECIMAL(38,%d)) THEN ",
+							 expr,
+							 expr, scale,
+							 maxLit, scale);
+			AppendNumericOutOfRangeAction(buf, expr, precision, scale,
+										  psprintf("numeric value exceeds max "
+												   "allowed value for DECIMAL(%d,%d)",
+												   precision, scale));
+
+			appendStringInfo(buf,
+							 " WHEN %s IS NOT NULL AND "
+							 "TRY_CAST(%s AS DECIMAL(38,%d)) < "
+							 "CAST('-%s' AS DECIMAL(38,%d)) THEN ",
+							 expr,
+							 expr, scale,
+							 maxLit, scale);
+			AppendNumericOutOfRangeAction(buf, expr, precision, scale,
+										  psprintf("numeric value exceeds min "
+												   "allowed value for DECIMAL(%d,%d)",
+												   precision, scale));
+		}
+
+		appendStringInfo(buf,
+						 " ELSE CAST(%s AS DECIMAL(%d,%d)) END",
+						 expr, precision, scale);
+	}
+	else
+	{
+		/* precision too big for DuckDB DECIMAL, keep as VARCHAR */
+		appendStringInfo(buf,
+						 " ELSE %s END",
+						 expr);
+	}
+}
+
+
+/*
+ * AppendNumericValidationExpr appends a CASE expression for a scalar
+ * numeric column, including the "AS alias" suffix.
+ */
+static void
+AppendNumericValidationExpr(StringInfo buf, const char *expr,
+							const char *alias, int typmod)
+{
+	AppendNumericValidationCaseExpr(buf, expr, typmod);
+	appendStringInfo(buf, " AS %s", alias);
+}
+
+
+/*
+ * AppendNumericArrayValidationExpr validates each element of a
+ * numeric[] column using DuckDB's list_transform().
+ *
+ * Generates: list_transform(col, __nv -> CASE ... END) AS col
+ */
+static void
+AppendNumericArrayValidationExpr(StringInfo buf, const char *expr,
+								 const char *alias, int typmod)
+{
+	appendStringInfo(buf, "list_transform(%s, __nv -> ", expr);
+	AppendNumericValidationCaseExpr(buf, "__nv", typmod);
+	appendStringInfo(buf, ") AS %s", alias);
+}
+
+
+/*
+ * IsNumericArrayType returns true if the given type OID is an array
+ * whose element type is NUMERICOID.
+ */
+static bool
+IsNumericArrayType(Oid typeOid)
+{
+	Oid			elemType = get_element_type(typeOid);
+
+	return OidIsValid(elemType) && elemType == NUMERICOID;
+}
+
+
+/*
+ * NeutralizeNumericCastsInQuery replaces ::numeric(p,s) casts in the
+ * query string with ::text.
+ *
+ * For INSERT..SELECT pushdown, PostgreSQL's planner adds type coercions
+ * like ::numeric(3,0) to match the target column type.  When DuckDB
+ * executes this cast, it may fail for values that exceed the target
+ * precision (e.g. a large value being cast to DECIMAL(3,0)).
+ *
+ * By replacing these casts with ::text, the value passes through as a
+ * VARCHAR string, and the numeric validation wrapper handles range
+ * checking, clamping, and final casting to the target DECIMAL type.
+ */
+static char *
+NeutralizeNumericCastsInQuery(char *query)
+{
+	StringInfoData result;
+	const char *p = query;
+
+	initStringInfo(&result);
+
+	while (*p != '\0')
+	{
+		/*
+		 * Look for the pattern ::numeric( followed by digits, comma, optional
+		 * space, digits, and closing paren.
+		 */
+		if (strncmp(p, "::numeric(", 10) == 0)
+		{
+			const char *start = p;
+			const char *scan = p + 10;	/* skip "::numeric(" */
+			bool		valid = true;
+
+			/* expect one or more digits */
+			if (!isdigit((unsigned char) *scan))
+				valid = false;
+			while (isdigit((unsigned char) *scan))
+				scan++;
+
+			/* expect comma and optional space */
+			if (valid && *scan == ',')
+				scan++;
+			else
+				valid = false;
+			while (*scan == ' ')
+				scan++;
+
+			/* expect one or more digits */
+			if (valid && !isdigit((unsigned char) *scan))
+				valid = false;
+			while (isdigit((unsigned char) *scan))
+				scan++;
+
+			/* expect closing paren */
+			if (valid && *scan == ')')
+			{
+				scan++;			/* skip ')' */
+				appendStringInfoString(&result, "::text");
+				p = scan;
+				continue;
+			}
+
+			/* not a match, copy the character as-is */
+			(void) start;		/* suppress unused warning */
+		}
+
+		appendStringInfoChar(&result, *p);
+		p++;
+	}
+
+	return result.data;
+}
+
+
+/*
+ * WrapQueryWithIcebergNumericValidation wraps a DuckDB query with
+ * validation expressions for numeric columns when writing to Iceberg.
+ *
+ * All writes (direct INSERT, INSERT..SELECT, COPY FROM) flow through
+ * WriteQueryResultTo, which calls this wrapper.  It ensures that:
+ *  - NaN/Infinity values are rejected or clamped
+ *  - Unbounded numeric digit limits are enforced
+ *  - Bounded numeric values exceeding DECIMAL(p,s) range are clamped
+ *  - Numeric values are cast from VARCHAR to DECIMAL(p,s)
+ *
+ * Handles both scalar numeric and numeric[] columns.
+ *
+ * If no numeric columns are found, the original query is returned as-is.
+ */
+static char *
+WrapQueryWithIcebergNumericValidation(char *query, TupleDesc tupleDesc)
+{
+	if (tupleDesc == NULL)
+		return query;
+
+	/* quick check: any numeric columns (scalar or array)? */
+	bool		hasNumericCol = false;
+
+	for (int i = 0; i < tupleDesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
+
+		if (attr->attisdropped)
+			continue;
+
+		if (attr->atttypid == NUMERICOID || IsNumericArrayType(attr->atttypid))
+		{
+			hasNumericCol = true;
+			break;
+		}
+	}
+
+	if (!hasNumericCol)
+		return query;
+
+	/*
+	 * Replace ::numeric(p,s) casts in the inner query with ::text. This
+	 * prevents DuckDB from failing on bounded numeric casts (e.g.
+	 * ::numeric(3,0)) when the source value exceeds the target precision. The
+	 * validation wrapper handles proper range checking and casting below.
+	 */
+	query = NeutralizeNumericCastsInQuery(query);
+
+	StringInfoData wrapped;
+
+	initStringInfo(&wrapped);
+	appendStringInfoString(&wrapped, "SELECT ");
+
+	bool		first = true;
+
+	for (int i = 0; i < tupleDesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
+
+		if (attr->attisdropped)
+			continue;
+
+		if (!first)
+			appendStringInfoString(&wrapped, ", ");
+		first = false;
+
+		const char *colName = quote_identifier(NameStr(attr->attname));
+
+		if (attr->atttypid == NUMERICOID)
+		{
+			AppendNumericValidationExpr(&wrapped, colName, colName,
+										attr->atttypmod);
+		}
+		else if (IsNumericArrayType(attr->atttypid))
+		{
+			AppendNumericArrayValidationExpr(&wrapped, colName, colName,
+											 attr->atttypmod);
+		}
+		else
+		{
+			appendStringInfoString(&wrapped, colName);
+		}
+	}
+
+	appendStringInfo(&wrapped, " FROM (%s) AS __iceberg_numeric_check", query);
+
+	return wrapped.data;
 }

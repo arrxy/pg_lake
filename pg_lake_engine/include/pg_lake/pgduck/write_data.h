@@ -33,6 +33,22 @@ typedef enum ParquetVersion
 	PARQUET_VERSION_V2 = 2
 } ParquetVersion;
 
+/*
+ * Behavior for out-of-range values during Iceberg writes.
+ * Applies to temporal types (date, timestamp, timestamptz) and
+ * numeric types (NaN/Inf, unbounded precision overflow).
+ *
+ * Controlled by the pg_lake_iceberg.out_of_range_values GUC.
+ */
+typedef enum IcebergOutOfRange
+{
+	ICEBERG_OUT_OF_RANGE_ERROR = 0,
+	ICEBERG_OUT_OF_RANGE_CLAMP = 1,
+}			IcebergOutOfRange;
+
+/* pg_lake_iceberg.out_of_range_values */
+extern PGDLLEXPORT int IcebergOutOfRangeValues;
+
 /* pg_lake_table.default_parquet_version */
 extern PGDLLEXPORT int DefaultParquetVersion;
 

@@ -18,14 +18,15 @@
 #include "postgres.h"
 
 #include "pg_lake/iceberg/utils.h"
+#include "pg_lake/pgduck/write_data.h"
 #include "utils/datetime.h"
 #include "utils/timestamp.h"
 
 static const int32 PostgresToUnixEpochDiffInDays = POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE;
 static const int64 PostgresToUnixEpochDiffInMicrosecs = ((int64) PostgresToUnixEpochDiffInDays) * USECS_PER_DAY;
 
-static void EnsureNotInfinityDate(DateADT date);
-static void EnsureNotInfinityTimestamp(Timestamp ts);
+static void ClampOrErrorIfInfinityDate(DateADT *date);
+static void ClampOrErrorIfInfinityTimestamp(Timestamp *ts);
 
 #define UNIX_EPOCH_YEAR 1970
 
@@ -124,7 +125,7 @@ AdjustTimestampFromPostgresToUnix(Timestamp timestamp)
 int32_t
 DateYearFromUnixEpoch(DateADT date)
 {
-	EnsureNotInfinityDate(date);
+	ClampOrErrorIfInfinityDate(&date);
 
 	int			year;
 	int			month;
@@ -257,7 +258,7 @@ YearsFromEpochToTimestamp(int32 yearsSinceEpoch)
 int32_t
 DateMonthFromUnixEpoch(DateADT date)
 {
-	EnsureNotInfinityDate(date);
+	ClampOrErrorIfInfinityDate(&date);
 
 	int			year;
 	int			month;
@@ -285,7 +286,7 @@ DateMonthFromUnixEpoch(DateADT date)
 int32_t
 DateDayFromUnixEpoch(DateADT date)
 {
-	EnsureNotInfinityDate(date);
+	ClampOrErrorIfInfinityDate(&date);
 
 	return (int32_t) AdjustDateFromPostgresToUnix(date);
 }
@@ -301,7 +302,7 @@ DateDayFromUnixEpoch(DateADT date)
 int32_t
 TimestampYearFromUnixEpoch(Timestamp ts)
 {
-	EnsureNotInfinityTimestamp(ts);
+	ClampOrErrorIfInfinityTimestamp(&ts);
 
 	struct pg_tm tm;
 	fsec_t		fsec;
@@ -325,7 +326,7 @@ TimestampYearFromUnixEpoch(Timestamp ts)
 int32_t
 TimestampMonthFromUnixEpoch(Timestamp ts)
 {
-	EnsureNotInfinityTimestamp(ts);
+	ClampOrErrorIfInfinityTimestamp(&ts);
 
 	struct pg_tm tm;
 	fsec_t		fsec;
@@ -386,7 +387,7 @@ MonthsFromUnixEpochToTimestamp(int32 monthsSinceEpoch)
 int32_t
 TimestampDayFromUnixEpoch(Timestamp ts)
 {
-	EnsureNotInfinityTimestamp(ts);
+	ClampOrErrorIfInfinityTimestamp(&ts);
 
 	Timestamp	unixTs = AdjustTimestampFromPostgresToUnix(ts);
 
@@ -405,7 +406,7 @@ TimestampDayFromUnixEpoch(Timestamp ts)
 int32_t
 TimestampHourFromUnixEpoch(Timestamp ts)
 {
-	EnsureNotInfinityTimestamp(ts);
+	ClampOrErrorIfInfinityTimestamp(&ts);
 
 	Timestamp	unixTs = AdjustTimestampFromPostgresToUnix(ts);
 
@@ -458,31 +459,108 @@ HoursFromUnixEpochToTime(int32 hoursSinceEpoch)
 
 
 /*
- * EnsureNotInfinityDate checks if the given date is +-Infinity.
- * If it is, it raises an error. +-Infinity is not a meaningful value for
- * some query engines.
+ * IcebergMinDate returns the DateADT representing 4713-01-01 BC
+ * (ISO year -4712), the effective lower bound for dates in Iceberg
+ * tables.
+ *
+ * The Iceberg spec allows years down to -9999, but PostgreSQL's
+ * date type only goes back to 4714-11-24 BC.  We use 4713-01-01 BC
+ * as a clean minimum that is safely within PostgreSQL's range.
+ */
+static DateADT
+IcebergMinDate(void)
+{
+	return (DateADT) (date2j(-4712, 1, 1) - POSTGRES_EPOCH_JDATE);
+}
+
+
+/*
+ * IcebergMaxDate returns the DateADT representing 9999-12-31,
+ * the upper bound of Iceberg's supported date range.
+ */
+static DateADT
+IcebergMaxDate(void)
+{
+	return (DateADT) (date2j(9999, 12, 31) - POSTGRES_EPOCH_JDATE);
+}
+
+
+/*
+ * IcebergMinTimestamp returns the Timestamp representing
+ * 0001-01-01 00:00:00, the lower bound of Iceberg's supported
+ * timestamp range.
+ */
+static Timestamp
+IcebergMinTimestamp(void)
+{
+	int64		days = (int64) (date2j(1, 1, 1) - POSTGRES_EPOCH_JDATE);
+
+	return (Timestamp) (days * USECS_PER_DAY);
+}
+
+
+/*
+ * IcebergMaxTimestamp returns the Timestamp representing
+ * 9999-12-31 23:59:59.999999, the upper bound of Iceberg's supported
+ * timestamp range.
+ */
+static Timestamp
+IcebergMaxTimestamp(void)
+{
+	int64		days = (int64) (date2j(9999, 12, 31) - POSTGRES_EPOCH_JDATE);
+
+	return (Timestamp) (days * USECS_PER_DAY + INT64CONST(86399999999));
+}
+
+
+/*
+ * ClampOrErrorIfInfinityDate checks if the given date is +-Infinity.
+ *
+ * In error mode (default), raises ERROR.
+ * In clamp mode, replaces the value with the nearest Iceberg bound.
  */
 static void
-EnsureNotInfinityDate(DateADT date)
+ClampOrErrorIfInfinityDate(DateADT *date)
 {
-	if (DATE_NOT_FINITE(date))
+	if (!DATE_NOT_FINITE(*date))
+		return;
+
+	if (IcebergOutOfRangeValues == ICEBERG_OUT_OF_RANGE_CLAMP)
+	{
+		*date = DATE_IS_NOBEGIN(*date) ? IcebergMinDate() : IcebergMaxDate();
+	}
+	else
+	{
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("+-Infinity dates are not allowed in iceberg tables"),
 				 errhint("Delete or replace +-Infinity values.")));
+	}
 }
 
+
 /*
- * EnsureNotInfinityTimestamp checks if the given timestamp is +-Infinity.
- * If it is, it raises an error. +-Infinity is not a meaningful value for
- * some query engines.
+ * ClampOrErrorIfInfinityTimestamp checks if the given timestamp is
+ * +-Infinity.
+ *
+ * In error mode (default), raises ERROR.
+ * In clamp mode, replaces the value with the nearest Iceberg bound.
  */
 static void
-EnsureNotInfinityTimestamp(Timestamp ts)
+ClampOrErrorIfInfinityTimestamp(Timestamp *ts)
 {
-	if (TIMESTAMP_NOT_FINITE(ts))
+	if (!TIMESTAMP_NOT_FINITE(*ts))
+		return;
+
+	if (IcebergOutOfRangeValues == ICEBERG_OUT_OF_RANGE_CLAMP)
+	{
+		*ts = TIMESTAMP_IS_NOBEGIN(*ts) ? IcebergMinTimestamp() : IcebergMaxTimestamp();
+	}
+	else
+	{
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("+-Infinity timestamps are not allowed in iceberg tables"),
 				 errhint("Delete or replace +-Infinity values.")));
+	}
 }

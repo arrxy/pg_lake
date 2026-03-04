@@ -441,21 +441,66 @@ TypeContainsUnsuitableForPushdown(Oid typeId, int32 typmod, CopyDataFormat sourc
 		return true;
 	}
 
+	/*
+	 * For Iceberg, WrapQueryWithIcebergNumericValidation handles all numeric
+	 * types (unbounded, bounded within/exceeding DuckDB limits) in the write
+	 * path.  However, the EXPLAIN path sends the raw deparsed query to DuckDB
+	 * without the wrapper, so a ::numeric(p,s) cast with scale>precision or
+	 * precision>38 would fail in DuckDB's parser.
+	 *
+	 * For Iceberg: allow pushdown for unbounded (typmod=-1, deparsed as
+	 * ::numeric without modifiers) and for bounded numerics whose raw
+	 * precision/scale is valid for DuckDB.
+	 *
+	 * For non-Iceberg: block pushdown for any numeric that DuckDB cannot
+	 * represent, including unbounded.
+	 */
 	if (typeId == NUMERICOID)
 	{
-		/* may fail if unbounded numeric exceeds duckdb limits (38,38) */
-		if (typmod == -1)
-			return false;
-
-		int			precision = numeric_typmod_precision(typmod);
-		int			scale = numeric_typmod_scale(typmod);
-
-		if (!CanPushdownNumericToDuckdb(precision, scale))
+		if (sourceFormat == DATA_FORMAT_ICEBERG)
 		{
-			ereport(DEBUG4,
-					(errmsg("Numeric type with precision(%d) and scale(%d) "
-							"is not pushdownable", precision, scale)));
-			return true;
+			/*
+			 * Unbounded numeric is deparsed as ::numeric (no modifiers),
+			 * which DuckDB handles fine.  The write wrapper takes care of
+			 * validation and casting.
+			 */
+			if (typmod == -1)
+				return false;
+
+			/*
+			 * Bounded numeric: check raw precision/scale.  If DuckDB's
+			 * parser can handle the raw ::numeric(p,s) cast, allow
+			 * pushdown.  Otherwise block, because the EXPLAIN path would
+			 * fail.
+			 */
+			int			precision = numeric_typmod_precision(typmod);
+			int			scale = numeric_typmod_scale(typmod);
+
+			if (!CanPushdownNumericToDuckdb(precision, scale))
+			{
+				ereport(DEBUG4,
+						(errmsg("Numeric type with precision(%d) and scale(%d) "
+								"is not pushdownable (raw type invalid for DuckDB)",
+								precision, scale)));
+				return true;
+			}
+		}
+		else
+		{
+			/* may fail if unbounded numeric exceeds duckdb limits (38,38) */
+			if (typmod == -1)
+				return true;
+
+			int			precision = numeric_typmod_precision(typmod);
+			int			scale = numeric_typmod_scale(typmod);
+
+			if (!CanPushdownNumericToDuckdb(precision, scale))
+			{
+				ereport(DEBUG4,
+						(errmsg("Numeric type with precision(%d) and scale(%d) "
+								"is not pushdownable", precision, scale)));
+				return true;
+			}
 		}
 	}
 
