@@ -37,6 +37,7 @@
 #include "pg_lake/planner/explain.h"
 #include "pg_lake/planner/pushdown_utils.h"
 #include "pg_lake/fdw/writable_table.h"
+#include "pg_lake/pgduck/write_validation.h"
 #include "pg_lake/planner/insert_select.h"
 #include "pg_lake/planner/query_pushdown.h"
 #include "pg_lake/planner/restriction_collector.h"
@@ -1547,11 +1548,19 @@ QueryPushdownScanNextInternal(CustomScanState *node)
 	if (scanState->insertIntoRelid != InvalidOid)
 	{
 		/*
+		 * Set out-of-range policy from the target table's option for this
+		 * INSERT..SELECT pushdown write.
+		 */
+		OutOfRangePolicy outOfRangePolicy =
+			GetOutOfRangePolicyForTable(scanState->insertIntoRelid);
+
+		/*
 		 * append the query result to the table and set the number of
 		 * processed rows
 		 */
 		scanState->estate->es_processed =
-			AddQueryResultToTable(scanState->insertIntoRelid, scanState->queryString, tupleDesc);
+			AddQueryResultToTable(scanState->insertIntoRelid, scanState->queryString, tupleDesc,
+								  outOfRangePolicy);
 
 		return NULL;
 	}

@@ -177,7 +177,8 @@ WriteQueryResultToCSV(char *query, char *destFile, int *maxLineSize)
 {
 	bool		includeHeader = true;
 	List	   *writeOptions = InternalCSVOptions(includeHeader);
-	DestReceiver *dest = CreateCSVDestReceiver(destFile, writeOptions, DATA_FORMAT_PARQUET);
+	DestReceiver *dest = CreateCSVDestReceiver(destFile, writeOptions, DATA_FORMAT_PARQUET,
+											   OUT_OF_RANGE_NONE);
 
 	int64		rowCount = ExecuteQueryStringToDestReceiver(query, dest);
 

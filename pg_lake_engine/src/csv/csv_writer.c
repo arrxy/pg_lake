@@ -34,8 +34,8 @@
 #include "commands/defrem.h"
 #include "pg_lake/csv/csv_writer.h"
 #include "pg_lake/extensions/postgis.h"
-#include "pg_lake/pgduck/numeric.h"
 #include "pg_lake/pgduck/serialize.h"
+#include "pg_lake/pgduck/write_validation.h"
 #include "pg_lake/util/numeric.h"
 #include "executor/executor.h"
 #include "mb/pg_wchar.h"
@@ -110,6 +110,9 @@ typedef struct CopyToStateData
 
 	/* whether the CSV writer should survive multiple transactions */
 	bool		sessionLifetime;
+
+	/* out-of-range policy for temporal/numeric validation */
+	OutOfRangePolicy outOfRangePolicy;
 } CopyToStateData;
 
 /* DestReceiver for COPY (query) TO */
@@ -142,8 +145,6 @@ static void CopySendInt16(CopyToState cstate, int16 val);
 static List *TupleDescColumnNameList(TupleDesc tupleDescriptor);
 static List *CopyGetAttnumsFixed(TupleDesc tupDesc, List *attnamelist);
 static bool ShouldUseDuckSerialization(CopyDataFormat targetFormat, PGType postgresType);
-static void ErrorIfCopyToExceedsUnboundedNumericMaxAllowedDigits(const char *numericStr);
-static void ErrorIfSpecialNumeric(const char *input_str);
 
 
 /*----------
@@ -646,73 +647,6 @@ CopyGetAttnumsFixed(TupleDesc tupDesc, List *attnamelist)
 	return attnums;
 }
 
-/*
- * ErrorIfCopyToExceedsUnboundedNumericMaxAllowedDigits ensures the integral
- * digits of the numeric string do not exceed the max allowed digits during
- * COPY TO.
- *
- * Excess fractional (decimal) digits are intentionally allowed here because
- * DuckDB's DECIMAL(P,S) will round them during the CSV-to-Parquet conversion.
- */
-static void
-ErrorIfCopyToExceedsUnboundedNumericMaxAllowedDigits(const char *numericStr)
-{
-	int			totalIntegralDigits = 0;
-	bool		foundDotSeparator = false;
-
-	for (int i = 0; numericStr[i] != '\0'; i++)
-	{
-		if (numericStr[i] == '.')
-		{
-			foundDotSeparator = true;
-			continue;
-		}
-
-		if (!isdigit(numericStr[i]))
-			continue;
-
-		if (!foundDotSeparator)
-			totalIntegralDigits++;
-
-		if (totalIntegralDigits > (UnboundedNumericDefaultPrecision - UnboundedNumericDefaultScale))
-		{
-			ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
-							errmsg("unbounded numeric type exceeds max allowed digits %d "
-								   "before decimal point",
-								   UnboundedNumericDefaultPrecision - UnboundedNumericDefaultScale),
-							errhint("Consider specifying precision and scale for numeric types, "
-									"i.e. \"numeric(P,S)\" instead of \"numeric\".")));
-		}
-	}
-}
-
-
-/*
-* ErrorIfSpecialNumeric ensures that the input string does not contain
-* special numeric values like NaN, Inf, -Inf.
-*/
-static void
-ErrorIfSpecialNumeric(const char *input_str)
-{
-
-	char	   *num = (char *) input_str;
-
-	/* skip leading whitespace */
-	while (*num != '\0' && isspace((unsigned char) *num))
-		num++;
-
-	if (pg_strncasecmp(num, "NaN", 3) == 0 ||
-		pg_strncasecmp(num, "Infinity", 8) == 0 ||
-		pg_strncasecmp(num, "+Infinity", 9) == 0 ||
-		pg_strncasecmp(num, "-Infinity", 9) == 0 ||
-		pg_strncasecmp(num, "inf", 3) == 0 ||
-		pg_strncasecmp(num, "+inf", 4) == 0 ||
-		pg_strncasecmp(num, "-inf", 4) == 0)
-	{
-		ereport(ERROR, errmsg("Special numeric values like NaN, Inf, -Inf are not allowed for numeric type"),
-				errhint("Use float type instead."));
-	}
-}
 
 
 /*
@@ -745,6 +679,14 @@ CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot)
 		Datum		value = slot->tts_values[attnum - 1];
 		bool		isnull = slot->tts_isnull[attnum - 1];
 
+		if (!isnull && cstate->outOfRangePolicy != OUT_OF_RANGE_NONE)
+		{
+			Form_pg_attribute attr = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1);
+
+			value = ValidateDatum(value, attr->atttypid, attr->atttypmod,
+								  cstate->outOfRangePolicy, &isnull);
+		}
+
 		if (!cstate->opts.binary)
 		{
 			if (need_delim)
@@ -763,10 +705,6 @@ CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot)
 		{
 			if (!cstate->opts.binary)
 			{
-				/*
-				 * Lookup the underlying tuple's attribute so we can pass in
-				 * the typid
-				 */
 				Form_pg_attribute attr = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1);
 
 				if (ShouldUseDuckSerialization(cstate->targetFormat, MakePGType(attr->atttypid, attr->atttypmod)))
@@ -785,16 +723,6 @@ CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot)
 				else
 					string = OutputFunctionCall(&out_functions[attnum - 1],
 												value);
-
-				if (attr->atttypid == NUMERICOID)
-				{
-					if (IsUnboundedNumeric(NUMERICOID, attr->atttypmod))
-						ErrorIfCopyToExceedsUnboundedNumericMaxAllowedDigits(string);
-
-					/* do not allow Nan, Inf etc. */
-					ErrorIfSpecialNumeric(string);
-				}
-
 
 				if (cstate->opts.csv_mode)
 					CopyAttributeOutCSV(cstate, string,
@@ -1130,7 +1058,8 @@ copy_dest_destroy(DestReceiver *self)
  */
 DestReceiver *
 CreateCSVDestReceiver(char *filename, List *copyOptions,
-					  CopyDataFormat targetFormat)
+					  CopyDataFormat targetFormat,
+					  OutOfRangePolicy outOfRangePolicy)
 {
 	DR_copy    *self = (DR_copy *) palloc0(sizeof(DR_copy));
 
@@ -1150,6 +1079,7 @@ CreateCSVDestReceiver(char *filename, List *copyOptions,
 	 */
 	self->cstate->quoteEmptyLines = true;
 	self->cstate->targetFormat = targetFormat;
+	self->cstate->outOfRangePolicy = outOfRangePolicy;
 
 	return (DestReceiver *) self;
 }
@@ -1162,10 +1092,12 @@ CreateCSVDestReceiver(char *filename, List *copyOptions,
 DestReceiver *
 CreateCSVDestReceiverExtended(char *filename, List *copyOptions,
 							  CopyDataFormat targetFormat,
-							  bool sessionLifetime)
+							  bool sessionLifetime,
+							  OutOfRangePolicy outOfRangePolicy)
 {
 	DR_copy    *self =
-		(DR_copy *) CreateCSVDestReceiver(filename, copyOptions, targetFormat);
+		(DR_copy *) CreateCSVDestReceiver(filename, copyOptions, targetFormat,
+										  outOfRangePolicy);
 
 	self->cstate->sessionLifetime = sessionLifetime;
 

@@ -48,6 +48,7 @@
 #include "pg_lake/iceberg/catalog.h"
 #include "pg_lake/parquet/field.h"
 #include "pg_lake/parsetree/columns.h"
+#include "pg_lake/parsetree/options.h"
 #include "pg_lake/permissions/roles.h"
 #include "pg_lake/planner/insert_select.h"
 #include "pg_lake/pgduck/cache_control.h"
@@ -56,6 +57,7 @@
 #include "pg_lake/pgduck/read_data.h"
 #include "pg_lake/pgduck/type.h"
 #include "pg_lake/pgduck/write_data.h"
+#include "pg_lake/pgduck/write_validation.h"
 #include "pg_lake/query/execute.h"
 #include "pg_lake/storage/local_storage.h"
 #include "pg_lake/util/numeric.h"
@@ -123,6 +125,8 @@ static void CheckCopyTablePermission(CopyStmt *copyStmt, ParseState *pstate,
 									 RTEPermissionInfo *perminfo);
 static void CheckCopyTableKind(CopyStmt *copyStmt, ParseState *pstate,
 							   Relation relation);
+static void EnsureOutOfRangeOptionAllowedForTable(List *options, Oid relationId);
+static void EnsureOutOfRangeOptionAllowedForFormat(List *options, CopyDataFormat format);
 static void ErrorIfCopyFromWithRowLevelSecurityEnabled(PlannedStmt *plannedStmt, Relation relation);
 static RawStmt *CreateQueryForCopyToCommand(PlannedStmt *plannedStmt, Relation relation);
 static TupleDesc BuildTupleDescriptorForRelation(Relation relation, List *attributeList);
@@ -421,6 +425,20 @@ ProcessPgLakeCopyFrom(CopyStmt *copyStmt, ParseState *pstate, Relation relation,
 	EnsureFormatSupported(sourceFormat, sourceCompression, false);
 
 	/*
+	 * Determine out-of-range policy from COPY option (if present) or fall
+	 * back to the target table's option.  Only parquet / iceberg tables
+	 * support this option; skip validation for other tables.
+	 */
+	EnsureOutOfRangeOptionAllowedForTable(copyStmt->options, relationId);
+
+	OutOfRangePolicy outOfRangePolicy;
+
+	if (HasOption(copyStmt->options, "out_of_range_values"))
+		outOfRangePolicy = GetOutOfRangePolicyFromOptions(copyStmt->options);
+	else
+		outOfRangePolicy = GetOutOfRangePolicyForTable(relationId);
+
+	/*
 	 * Find which options should pass through COPY .. FROM and do early
 	 * validation.
 	 *
@@ -527,7 +545,8 @@ ProcessPgLakeCopyFrom(CopyStmt *copyStmt, ParseState *pstate, Relation relation,
 	 */
 	if (doCopyPushdown)
 	{
-		*rowsProcessed = AddQueryResultToTable(relationId, readQuery, tupleDesc);
+		*rowsProcessed = AddQueryResultToTable(relationId, readQuery, tupleDesc,
+											   outOfRangePolicy);
 		return;
 	}
 
@@ -635,6 +654,12 @@ IsCopyFromPushdownable(Relation relation, List *columnNameList,
 	if (!IsWritablePgLakeTable(relationId) && !IsWritableIcebergTable(relationId))
 		return false;
 
+	OutOfRangePolicy oorPolicy = GetOutOfRangePolicyForTable(relationId);
+
+	if (oorPolicy != OUT_OF_RANGE_NONE &&
+		TupleDescNeedsValidation(RelationGetDescr(relation), oorPolicy))
+		return false;
+
 	bool		allowDefaultConsts = false;
 
 	if (!RelationSuitableForPushdown(relation, allowDefaultConsts))
@@ -711,7 +736,8 @@ FindCopyFromWriteOptions(CopyDataFormat format, List *options)
 		if (strcmp(option->defname, "format") == 0 ||
 			strcmp(option->defname, "compression") == 0 ||
 			strcmp(option->defname, "auto_detect") == 0 ||
-			strcmp(option->defname, "filename") == 0)
+			strcmp(option->defname, "filename") == 0 ||
+			strcmp(option->defname, "out_of_range_values") == 0)
 		{
 			continue;
 		}
@@ -800,6 +826,19 @@ ProcessPgLakeCopyTo(CopyStmt *copyStmt, ParseState *pstate, Relation relation,
 								 &destinationFormat, &destinationCompression);
 
 	/*
+	 * Determine out-of-range policy from COPY option (if present). Only
+	 * parquet / iceberg destination formats support this option.
+	 */
+	EnsureOutOfRangeOptionAllowedForFormat(copyStmt->options, destinationFormat);
+
+	OutOfRangePolicy outOfRangePolicy = OUT_OF_RANGE_NONE;
+
+	if (HasOption(copyStmt->options, "out_of_range_values"))
+		outOfRangePolicy = GetOutOfRangePolicyFromOptions(copyStmt->options);
+	else if (FormatUsesParquet(destinationFormat))
+		outOfRangePolicy = OUT_OF_RANGE_CLAMP;
+
+	/*
 	 * Error early for unsupported compression
 	 */
 	EnsureFormatSupported(destinationFormat, destinationCompression, true);
@@ -877,7 +916,9 @@ ProcessPgLakeCopyTo(CopyStmt *copyStmt, ParseState *pstate, Relation relation,
 	char	   *tempCSVPath = GenerateTempFileName(TEMP_FILE_PATTERN, ensureCleanup);
 
 	/* execute query and write results to CSV */
-	DestReceiver *dest = CreateCSVDestReceiver(tempCSVPath, readOptions, destinationFormat);
+	DestReceiver *dest = CreateCSVDestReceiver(tempCSVPath, readOptions,
+											   destinationFormat,
+											   outOfRangePolicy);
 
 	*rowsProcessed = ExecuteQueryToDestReceiver(query, queryString, NULL, dest);
 
@@ -917,13 +958,51 @@ ProcessPgLakeCopyTo(CopyStmt *copyStmt, ParseState *pstate, Relation relation,
 	 */
 	ConvertCSVFileTo(tempCSVPath, tupleDesc, maximumLineLength,
 					 destinationPath, destinationFormat, destinationCompression,
-					 copyStmt->options, schema, NIL);
+					 copyStmt->options, schema, NIL,
+					 outOfRangePolicy);
 
 	if (IsCopyToStdout(copyStmt))
 	{
 		/* send the temporary file in the target format to the client */
 		CopyFileToOutput(destinationPath, tupleDesc->natts, true);
 	}
+}
+
+
+/*
+ * EnsureOutOfRangeOptionAllowedForTable errors if the out_of_range_values COPY
+ * option is present but the target relation is not a pg_lake or iceberg
+ * table.
+ */
+static void
+EnsureOutOfRangeOptionAllowedForTable(List *options, Oid relationId)
+{
+	if (!HasOption(options, "out_of_range_values"))
+		return;
+
+	if (!IsPgLakeForeignTableById(relationId) && !IsIcebergTable(relationId))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"out_of_range_values\" option is only supported for "
+						"parquet or iceberg tables")));
+}
+
+
+/*
+ * EnsureOutOfRangeOptionAllowedForFormat errors if the out_of_range_values
+ * COPY option is present but the destination format is not parquet or iceberg.
+ */
+static void
+EnsureOutOfRangeOptionAllowedForFormat(List *options, CopyDataFormat format)
+{
+	if (!HasOption(options, "out_of_range_values"))
+		return;
+
+	if (!FormatUsesParquet(format))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"out_of_range_values\" option is only supported for "
+						"parquet or iceberg formats")));
 }
 
 
@@ -997,7 +1076,8 @@ FindCopyToReadOptions(CopyDataFormat format, List *options)
 
 		/* common options that should not pass through */
 		if (strcmp(option->defname, "format") == 0 ||
-			strcmp(option->defname, "compression") == 0)
+			strcmp(option->defname, "compression") == 0 ||
+			strcmp(option->defname, "out_of_range_values") == 0)
 		{
 			/* we do not pass on our custom format / compression */
 			continue;

@@ -22,10 +22,9 @@
 #include "pg_lake/iceberg/catalog.h"
 #include "pg_lake/planner/insert_select.h"
 #include "pg_lake/planner/query_pushdown.h"
-#include "pg_lake/util/numeric.h"
+#include "pg_lake/pgduck/write_validation.h"
 #include "pg_lake/partitioning/partition_by_parser.h"
 #include "pg_lake/pgduck/map.h"
-#include "pg_lake/pgduck/numeric.h"
 #include "pg_lake/util/rel_utils.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -97,6 +96,18 @@ IsPushdownableInsertSelectQuery(Query *query)
 	}
 
 	Relation	insertRelation = RelationIdGetRelation(insertIntoRelid);
+
+	OutOfRangePolicy oorPolicy = GetOutOfRangePolicyForTable(insertIntoRelid);
+
+	if (oorPolicy != OUT_OF_RANGE_NONE &&
+		TupleDescNeedsValidation(RelationGetDescr(insertRelation), oorPolicy))
+	{
+		ereport(DEBUG4,
+				(errmsg("INSERT..SELECT with out_of_range_values policy is not pushdownable")));
+
+		RelationClose(insertRelation);
+		return false;
+	}
 
 	bool		allowDefaultConsts = true;
 
@@ -260,8 +271,7 @@ TransformPushdownableInsertSelect(Query *query)
 	 * excludes columns that do not have a default value. Expand the list by
 	 * adding the remaining columns with NULL constants.
 	 */
-	RangeTblEntry *insertRte = GetInsertRteFromInsertSelect(query);
-	Oid			insertRelid = insertRte->relid;
+	Oid			insertRelid = GetInsertRelidFromInsertSelect(query);
 	Relation	insertRel = table_open(insertRelid, RowExclusiveLock);
 	TupleDesc	relationTupleDesc = RelationGetDescr(insertRel);
 
@@ -441,24 +451,6 @@ TypeContainsUnsuitableForPushdown(Oid typeId, int32 typmod, CopyDataFormat sourc
 		return true;
 	}
 
-	if (typeId == NUMERICOID)
-	{
-		/* may fail if unbounded numeric exceeds duckdb limits (38,38) */
-		if (typmod == -1)
-			return false;
-
-		int			precision = numeric_typmod_precision(typmod);
-		int			scale = numeric_typmod_scale(typmod);
-
-		if (!CanPushdownNumericToDuckdb(precision, scale))
-		{
-			ereport(DEBUG4,
-					(errmsg("Numeric type with precision(%d) and scale(%d) "
-							"is not pushdownable", precision, scale)));
-			return true;
-		}
-	}
-
 	/* Recurse into array element type */
 	if (type_is_array(typeId))
 	{
@@ -533,3 +525,5 @@ RelationColumnsSuitableForPushdown(Relation relation, CopyDataFormat sourceForma
 
 	return true;
 }
+
+
