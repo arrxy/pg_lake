@@ -317,6 +317,8 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	AvroInit();
+
+	InstallUserMappingScrubHook();
 }
 
 

@@ -39,6 +39,9 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
+#include "nodes/parsenodes.h"
+#include "tcop/utility.h"
+
 #include "pg_extension_base/base_workers.h"
 #include "pg_lake/http/http_client.h"
 #include "pg_lake/iceberg/api/table_schema.h"
@@ -106,6 +109,12 @@ static const char *iceberg_catalog_user_mapping_options[] = {
 	"client_id",
 	"client_secret",
 	"scope",
+	NULL
+};
+
+static const char *iceberg_catalog_secret_options[] = {
+	"client_id",
+	"client_secret",
 	NULL
 };
 
@@ -199,6 +208,175 @@ iceberg_catalog_validator(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * IsIcebergCatalogServer returns true if the named server exists and uses
+ * the iceberg_catalog FDW.  Returns false (without error) if the server
+ * does not exist.
+ */
+static bool
+IsIcebergCatalogServer(const char *serverName)
+{
+	ForeignServer *server = GetForeignServerByName(serverName, true);
+
+	if (server == NULL)
+		return false;
+
+	ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+
+	return strcmp(fdw->fdwname, ICEBERG_CATALOG_FDW_NAME) == 0;
+}
+
+
+/*
+ * ScrubUserMappingQueryString replaces secret option values in the
+ * query string with '***'.  We scan forward from each secret option's
+ * DefElem.location to find the single-quoted value and overwrite it.
+ *
+ * Returns a palloc'd scrubbed copy, or NULL if nothing needed scrubbing.
+ */
+static char *
+ScrubUserMappingQueryString(const char *queryString, List *options)
+{
+	char	   *scrubbed = NULL;
+	int			offset_delta = 0;
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (!is_valid_option_in_list(def->defname, iceberg_catalog_secret_options))
+			continue;
+
+		if (def->location < 0)
+			continue;
+
+		if (scrubbed == NULL)
+			scrubbed = pstrdup(queryString);
+
+		/*
+		 * Adjust for earlier replacements that changed the string length.
+		 * def->location is relative to the original queryString; offset_delta
+		 * tracks the cumulative shift from prior scrubs.
+		 */
+		char	   *p = scrubbed + def->location + offset_delta;
+
+		/* skip past the key name */
+		while (*p && !isspace((unsigned char) *p) && *p != '\'')
+			p++;
+
+		/* skip whitespace between key and value */
+		while (*p && *p != '\'')
+			p++;
+
+		if (*p != '\'')
+			continue;
+
+		char	   *start = p;
+		p++;
+
+		/* find closing quote, handling '' and \' escapes */
+		while (*p && *p != '\'')
+			p++;
+		while (*(p + 1) == '\'')
+		{
+			p += 2;
+			while (*p && *p != '\'')
+				p++;
+		}
+
+		if (*p != '\'')
+			continue;
+
+		/* replace [start .. p] (both quotes inclusive) with '***' */
+		int			old_span = (p - start) + 1;
+		int			new_span = 5;	/* '***' */
+
+		if (old_span != new_span)
+		{
+			int			tail_len = strlen(p + 1) + 1;
+
+			memmove(start + new_span, p + 1, tail_len);
+			offset_delta += new_span - old_span;
+		}
+
+		memcpy(start, "'***'", 5);
+	}
+
+	return scrubbed;
+}
+
+
+static ProcessUtility_hook_type PrevScrubProcessUtility = NULL;
+
+/*
+ * ScrubIcebergUserMappingHook is a ProcessUtility hook that replaces
+ * secret option values in CREATE/ALTER USER MAPPING statements targeting
+ * iceberg_catalog servers, before any downstream hooks (pg_stat_statements,
+ * pgaudit, log_statement) see the query string.
+ *
+ * Installed from pg_lake_iceberg's _PG_init so it wraps around hooks
+ * that were registered earlier (e.g. pg_stat_statements from
+ * shared_preload_libraries).
+ */
+static void
+ScrubIcebergUserMappingHook(PlannedStmt *plannedStmt,
+							const char *queryString,
+							bool readOnlyTree,
+							ProcessUtilityContext context,
+							ParamListInfo params,
+							struct QueryEnvironment *queryEnv,
+							DestReceiver *dest,
+							QueryCompletion *completionTag)
+{
+	Node	   *parsetree = plannedStmt->utilityStmt;
+	const char *serverName = NULL;
+	List	   *options = NIL;
+
+	if (IsA(parsetree, CreateUserMappingStmt))
+	{
+		CreateUserMappingStmt *stmt = (CreateUserMappingStmt *) parsetree;
+
+		serverName = stmt->servername;
+		options = stmt->options;
+	}
+	else if (IsA(parsetree, AlterUserMappingStmt))
+	{
+		AlterUserMappingStmt *stmt = (AlterUserMappingStmt *) parsetree;
+
+		serverName = stmt->servername;
+		options = stmt->options;
+	}
+
+	if (serverName != NULL && options != NIL && IsIcebergCatalogServer(serverName))
+	{
+		char	   *scrubbed = ScrubUserMappingQueryString(queryString, options);
+
+		if (scrubbed != NULL)
+			queryString = scrubbed;
+	}
+
+	if (PrevScrubProcessUtility)
+		PrevScrubProcessUtility(plannedStmt, queryString, readOnlyTree,
+								context, params, queryEnv, dest, completionTag);
+	else
+		standard_ProcessUtility(plannedStmt, queryString, readOnlyTree,
+								context, params, queryEnv, dest, completionTag);
+}
+
+
+/*
+ * InstallUserMappingScrubHook installs the ProcessUtility hook that
+ * scrubs secrets from user mapping DDL.  Must be called from _PG_init.
+ */
+void
+InstallUserMappingScrubHook(void)
+{
+	PrevScrubProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = ScrubIcebergUserMappingHook;
 }
 
 
