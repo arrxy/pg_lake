@@ -11,6 +11,11 @@ duckdb_extension_load(aws
     GIT_TAG 55bf3621fb7db254b473c94ce6360643ca38fac0
 )
 
+duckdb_extension_load(azure
+    GIT_URL https://github.com/duckdb/duckdb-azure
+    GIT_TAG 83789c4ee6d145b5747eeed30f7fc167f483b5a0
+)
+
 # Extension from this repo
 duckdb_extension_load(duckdb_pglake
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}

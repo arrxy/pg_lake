@@ -133,7 +133,7 @@ release: patch_duckdb
 #### Misc
 
 patch_duckdb: $(shell find patches -type f -name '*.patch')
-	for patchdir in duckdb duckdb-postgres duckdb-azure; do \
+	for patchdir in duckdb duckdb-postgres ; do \
 		(cd $$patchdir && \
 		git checkout -f . && \
 		find ../patches/$$patchdir -type f -name '*.patch' -print | sort | xargs -0 printf '%s ' | \
@@ -144,7 +144,7 @@ patch_duckdb: $(shell find patches -type f -name '*.patch')
 	done
 
 clean_patches:
-	for patchdir in duckdb duckdb-postgres duckdb-azure; do \
+	for patchdir in duckdb duckdb-postgres ; do \
 		(cd $$patchdir && \
 		git checkout -f . ); \
 	done
